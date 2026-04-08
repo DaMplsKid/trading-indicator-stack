@@ -1,0 +1,1484 @@
+//@version=5
+indicator("WAE + JMA/iTrend + IVR + URE + Trail v5.9", shorttitle="WAE+iT5.9", overlay=false, max_lines_count=500, max_labels_count=500, max_bars_back=500)
+
+//════════════════════════════════════════════════════════════════════════════════
+// DISPLAY OPTIONS
+//════════════════════════════════════════════════════════════════════════════════
+showWAE = input.bool(false, "Show WAE Indicator", group="Display Settings")
+showDirection = input.bool(true, "Show Direction Indicator", group="Display Settings")
+showVolRegime = input.bool(true, "Show Volatility Regime", group="Display Settings")
+showUREFill = input.bool(true, "Show URE State Fill", group="Display Settings")
+showTrailSignals = input.bool(true, "Show Trail Stop Buy/Sell Signals", group="Display Settings")
+
+//════════════════════════════════════════════════════════════════════════════════
+// WAE SECTION
+//════════════════════════════════════════════════════════════════════════════════
+
+jma_func(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jma_val = na
+    e0 := (1 - alpha) * src + alpha * nz(e0[1], src)
+    e1 := (src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jma_val[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jma_val := e2 + nz(jma_val[1], src)
+    jma_val
+
+ehlersDominantCycle(src, minCycle, maxCycle) =>
+    var float smooth = na
+    smooth := (4 * src + 3 * nz(src[1]) + 2 * nz(src[2]) + nz(src[3])) / 10
+    var float i1 = 0.0
+    var float q1 = 0.0
+    var float i2 = 0.0
+    var float q2 = 0.0
+    var float re = 0.0
+    var float im = 0.0
+    i1 := nz(smooth[3])
+    q1 := (smooth - nz(smooth[6])) / 2.0
+    i2 := 0.2 * i1 + 0.8 * nz(i2[1])
+    q2 := 0.2 * q1 + 0.8 * nz(q2[1])
+    re := 0.2 * (i2 * nz(i2[1]) + q2 * nz(q2[1])) + 0.8 * nz(re[1])
+    im := 0.2 * (i2 * nz(q2[1]) - q2 * nz(i2[1])) + 0.8 * nz(im[1])
+    period = im != 0 and re != 0 ? 2 * math.pi / math.atan(im / re) : 0
+    period := period < minCycle ? minCycle : period > maxCycle ? maxCycle : period
+    var float smoothPeriod = na
+    smoothPeriod := 0.33 * period + 0.67 * nz(smoothPeriod[1], period)
+    math.round(smoothPeriod)
+
+gaussianKernel(x, bandwidth) => math.exp(-math.pow(x, 2) / (bandwidth * bandwidth * 2))
+
+kernelRegression(src, kernelLen) =>
+    sum = 0.0
+    sumw = 0.0
+    for i = 0 to kernelLen - 1
+        weight = gaussianKernel(i, kernelLen)
+        sum += src[i] * weight
+        sumw += weight
+    sumw != 0 ? sum / sumw : na
+
+sensitivity = input.int(7, title="WAE Sensitivity", group="WAE Settings")
+
+useAdaptiveCycle = input.bool(true, title="Use Adaptive Cycle (Ehlers)", group="WAE Adaptive Cycle")
+minCycleLength = input.int(5, title="Min Cycle Length", minval=1, group="WAE Adaptive Cycle")
+maxCycleLength = input.int(16, title="Max Cycle Length", minval=1, group="WAE Adaptive Cycle")
+manualCycleLength = input.int(8, title="Manual Cycle Length", minval=1, group="WAE Adaptive Cycle")
+
+volLength = input.int(title="Volatility JMA Base Length", defval=5, minval=1, group="WAE Volatility JMA (Fast)")
+volPhase = input.int(title="Volatility JMA Phase", defval=40, minval=-100, maxval=100, group="WAE Volatility JMA (Fast)")
+volPower = input.int(title="Volatility JMA Power", defval=4, minval=1, group="WAE Volatility JMA (Fast)")
+volatilityLength = input.int(title="Volatility Period", defval=7, minval=1, group="WAE Volatility JMA (Fast)")
+volCycleMultiplier = input.float(title="Vol Cycle Multiplier", defval=1.0, minval=0.1, maxval=2.0, step=0.1, group="WAE Volatility JMA (Fast)")
+
+vwjmaLength = input.int(title="VW-JMA Base Length", defval=16, minval=1, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaPhase = input.int(title="VW-JMA Phase", defval=40, minval=-100, maxval=100, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaPower = input.int(title="VW-JMA Power", defval=4, minval=1, group="WAE Volume-Weighted JMA (Slow)")
+minVolumeThreshold = input.float(title="Min Volume Threshold (% of avg)", defval=50.0, minval=0.1, maxval=100, group="WAE Volume-Weighted JMA (Slow)")
+useExtendedHours = input.bool(title="Detect Extended Hours", defval=true, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaSmoothing = input.int(title="VW-JMA Smoothing Period", defval=9, minval=1, maxval=10, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaCycleMultiplier = input.float(title="VW-JMA Cycle Multiplier", defval=1.0, minval=0.1, maxval=2.0, step=0.1, group="WAE Volume-Weighted JMA (Slow)")
+
+kernelLen = input.int(6, title="Kernel Length", minval=2, group="WAE Kernel Bands")
+kernelMult = input.float(3.618, title="Kernel Band Multiplier", minval=0.1, group="WAE Kernel Bands")
+
+dominantCycle = ehlersDominantCycle(close, minCycleLength, maxCycleLength)
+baseCycle = useAdaptiveCycle ? dominantCycle : manualCycleLength
+adaptiveVolLength = math.round(baseCycle * volCycleMultiplier)
+adaptiveVWJMALength = math.round(baseCycle * vwjmaCycleMultiplier)
+
+DEAD_ZONE = ta.rma(ta.tr(true), 100) * 3.7
+
+wae_median = ta.median(close, volatilityLength)
+wae_mad = ta.median(math.abs(close - wae_median), volatilityLength)
+wae_volatility = wae_mad * 1.4826
+wae_volatility := na(wae_volatility) or wae_volatility == 0 ? 1 : wae_volatility
+volatilityWeight = wae_volatility / ta.ema(wae_volatility, volatilityLength)
+weightedSrc = close * volatilityWeight
+
+volPhaseRatio = volPhase < -100 ? 0.5 : volPhase > 100 ? 2.5 : volPhase / 100 + 1.5
+volBeta = 0.45 * (adaptiveVolLength - 1) / (0.45 * (adaptiveVolLength - 1) + 2)
+volAlpha = math.pow(volBeta, volPower)
+
+var float vol_e0_vw = 0.0
+vol_e0_vw := (1 - volAlpha) * weightedSrc + volAlpha * vol_e0_vw
+var float vol_e1_vw = 0.0
+vol_e1_vw := (weightedSrc - vol_e0_vw) * (1 - volBeta) + volBeta * vol_e1_vw
+var float vol_e2_vw = 0.0
+var float vol_jma_vw = 0.0
+vol_e2_vw := (vol_e0_vw + volPhaseRatio * vol_e1_vw - vol_jma_vw) * math.pow(1 - volAlpha, 2) + math.pow(volAlpha, 2) * vol_e2_vw
+vol_jma_vw := vol_e2_vw + vol_jma_vw
+
+var float vol_e0_vol = 0.0
+vol_e0_vol := (1 - volAlpha) * volatilityWeight + volAlpha * vol_e0_vol
+var float vol_e1_vol = 0.0
+vol_e1_vol := (volatilityWeight - vol_e0_vol) * (1 - volBeta) + volBeta * vol_e1_vol
+var float vol_e2_vol = 0.0
+var float vol_jma_vol = 0.0
+vol_e2_vol := (vol_e0_vol + volPhaseRatio * vol_e1_vol - vol_jma_vol) * math.pow(1 - volAlpha, 2) + math.pow(volAlpha, 2) * vol_e2_vol
+vol_jma_vol := vol_e2_vol + vol_jma_vol
+
+volatilityJMA = vol_jma_vol != 0 ? vol_jma_vw / vol_jma_vol : close
+
+deltaVolume = close > open ? volume : close < open ? -volume : 0
+var float cvd = 0.0
+cvd += deltaVolume
+
+isExtendedHours = useExtendedHours ? not na(time(timeframe.period, "0930-1600", "America/New_York")) == false : false
+avgVolume = ta.sma(volume, adaptiveVWJMALength * 2)
+volThreshold_wae = avgVolume * (minVolumeThreshold / 100.0)
+isLowVolume = volume < volThreshold_wae or isExtendedHours
+volumeStdev = ta.stdev(volume, adaptiveVWJMALength)
+volumeChange = math.abs(volume - volume[1])
+isErraticVolume = volumeStdev > 0 and volumeChange > (volumeStdev * 3)
+useRegularJMA = isLowVolume or isErraticVolume
+
+regularJMA = jma_func(close, adaptiveVWJMALength, vwjmaPhase, vwjmaPower)
+
+cvdPhaseRatio = vwjmaPhase < -100 ? 0.5 : vwjmaPhase > 100 ? 2.5 : vwjmaPhase / 100 + 1.5
+cvdBeta = 0.45 * (adaptiveVWJMALength - 1) / (0.45 * (adaptiveVWJMALength - 1) + 2)
+cvdAlpha = math.pow(cvdBeta, vwjmaPower)
+
+maxVolume = avgVolume * 5
+minVolume = avgVolume * 0.1
+clampedVolume = math.max(minVolume, math.min(volume, maxVolume))
+normalizedVolume = clampedVolume > 0 ? clampedVolume : 1.0
+cvdWeight = cvd != 0 ? (1 + (deltaVolume / math.max(math.abs(cvd), volume))) : 1.0
+cvdWeightedVolume = normalizedVolume * cvdWeight
+rvwapPrice = close * cvdWeightedVolume
+smoothVol = cvdWeightedVolume
+
+var float cvd_e0_vw = 0.0
+cvd_e0_vw := (1 - cvdAlpha) * rvwapPrice + cvdAlpha * cvd_e0_vw
+var float cvd_e1_vw = 0.0
+cvd_e1_vw := (rvwapPrice - cvd_e0_vw) * (1 - cvdBeta) + cvdBeta * cvd_e1_vw
+var float cvd_e2_vw = 0.0
+var float cvd_jma_numerator = 0.0
+cvd_e2_vw := (cvd_e0_vw + cvdPhaseRatio * cvd_e1_vw - cvd_jma_numerator) * math.pow(1 - cvdAlpha, 2) + math.pow(cvdAlpha, 2) * cvd_e2_vw
+cvd_jma_numerator := cvd_e2_vw + cvd_jma_numerator
+
+var float cvd_e0_vol = 0.0
+cvd_e0_vol := (1 - cvdAlpha) * smoothVol + cvdAlpha * cvd_e0_vol
+var float cvd_e1_vol = 0.0
+cvd_e1_vol := (smoothVol - cvd_e0_vol) * (1 - cvdBeta) + cvdBeta * cvd_e1_vol
+var float cvd_e2_vol = 0.0
+var float cvd_jma_denominator = 0.0
+cvd_e2_vol := (cvd_e0_vol + cvdPhaseRatio * cvd_e1_vol - cvd_jma_denominator) * math.pow(1 - cvdAlpha, 2) + math.pow(cvdAlpha, 2) * cvd_e2_vol
+cvd_jma_denominator := cvd_e2_vol + cvd_jma_denominator
+
+cvdRVWAPJMA_raw = cvd_jma_denominator != 0 ? cvd_jma_numerator / cvd_jma_denominator : close
+priceDeviation = math.abs(cvdRVWAPJMA_raw - close) / close
+isTooDeviated = priceDeviation > 0.05
+
+var float lastValidCVDRVWAP = na
+if not useRegularJMA and not isTooDeviated and not na(cvdRVWAPJMA_raw)
+    lastValidCVDRVWAP := cvdRVWAPJMA_raw
+
+cvdRVWAPJMA_temp = (useRegularJMA or isTooDeviated) ? regularJMA : cvdRVWAPJMA_raw
+smoothingAlpha = 2.0 / (vwjmaSmoothing + 1)
+var float cvdRVWAPJMA = na
+cvdRVWAPJMA := na(cvdRVWAPJMA) ? cvdRVWAPJMA_temp :
+  smoothingAlpha * cvdRVWAPJMA_temp + (1 - smoothingAlpha) * cvdRVWAPJMA
+if useRegularJMA
+    extraSmoothing = 2.0 / (vwjmaSmoothing * 2 + 1)
+    cvdRVWAPJMA := extraSmoothing * cvdRVWAPJMA_temp + (1 - extraSmoothing) * cvdRVWAPJMA
+
+macd_value = volatilityJMA - cvdRVWAPJMA
+macd_value_prev = volatilityJMA[1] - cvdRVWAPJMA[1]
+t1 = (macd_value - macd_value_prev) * sensitivity
+
+kr_mean = kernelRegression(close, kernelLen)
+kr_dev = 0.0
+sumw = 0.0
+for i = 0 to kernelLen - 1
+    weight = gaussianKernel(i, kernelLen)
+    kr_dev += math.abs(close[i] - kr_mean) * weight
+    sumw += weight
+kr_dev := sumw != 0 ? kr_dev / sumw : na
+kr_upper = kr_mean + kernelMult * kr_dev
+kr_lower = kr_mean - kernelMult * kr_dev
+e1_val = kr_upper - kr_lower
+
+trendUp = (t1 >= 0) ? t1 : 0
+trendDown = (t1 < 0) ? -t1 : 0
+
+//════════════════════════════════════════════════════════════════════════════════
+// VOLATILITY REGIME ENGINE
+//════════════════════════════════════════════════════════════════════════════════
+
+grpVRE = "Volatility Regime"
+vre_madLen = input.int(6, "MAD Length", minval=5, group=grpVRE)
+vre_madSlopeLen = input.int(4, "MAD Slope Length", minval=1, group=grpVRE)
+vre_pressureLen = input.int(3, "Pressure Length", minval=2, group=grpVRE)
+vre_pressureThresh = input.float(0.6, "Pressure Threshold", minval=0.1, step=0.1, group=grpVRE)
+vre_bwRocLen = input.int(6, "Band Width ROC Length", minval=1, group=grpVRE)
+vre_effLen = input.int(3, "Efficiency Length", minval=2, group=grpVRE)
+vre_smoothLen = input.int(1, "Smoothing Length", minval=1, group=grpVRE)
+
+vre_col_ignition = input.color(color.new(#FF9800, 30), "🚀 Trend Ignition Color", group=grpVRE)
+vre_col_fake = input.color(color.new(color.red, 30), "⚠️ Fake Breakout Color", group=grpVRE)
+vre_col_reversion = input.color(color.new(color.blue, 40), "🔄 Mean Reversion Color", group=grpVRE)
+vre_col_churn = input.color(color.new(#0044FF, 35), "🌪️ Volatility Churn Color", group=grpVRE)
+vre_height_pct = input.float(0.4, "Regime Column Height (vs Direction)", minval=0.1, maxval=2.0, step=0.05, group=grpVRE)
+
+vre_medianPrice = ta.percentile_linear_interpolation(close, vre_madLen, 50)
+vre_madRaw = ta.percentile_linear_interpolation(math.abs(close - vre_medianPrice), vre_madLen, 50)
+vre_madVol = 1.4826 * vre_madRaw
+vre_madSlope = ta.linreg(vre_madVol, vre_madSlopeLen, 0)
+
+vre_roc = ta.roc(close, 1)
+vre_volNorm = volume / ta.sma(volume, vre_pressureLen)
+vre_pressure = vre_roc * vre_volNorm
+vre_pressureSmooth = ta.ema(vre_pressure, vre_smoothLen)
+vre_pressureStd = ta.stdev(vre_pressureSmooth, vre_pressureLen)
+vre_pressureNorm = vre_pressureStd != 0 ? vre_pressureSmooth / vre_pressureStd : 0.0
+
+vre_pressureFactor = math.min(math.max(math.abs(vre_pressureNorm), 0.5), 2.0)
+vre_upperBand = vre_medianPrice + vre_madVol * vre_pressureFactor
+vre_lowerBand = vre_medianPrice - vre_madVol * vre_pressureFactor
+vre_bandWidth = vre_upperBand - vre_lowerBand
+vre_bwRoc = ta.roc(vre_bandWidth, vre_bwRocLen)
+
+vre_netMove = math.abs(close - close[vre_effLen])
+vre_grossMove = ta.sma(math.abs(close - close[1]), vre_effLen) * vre_effLen
+vre_effRatio = vre_grossMove != 0 ? vre_netMove / vre_grossMove : 0
+
+vre_volExpanding = vre_madSlope > 0
+vre_volContracting = vre_madSlope <= 0
+vre_intentStrong = vre_bwRoc > 0 and vre_pressureNorm > vre_pressureThresh
+vre_intentWeak = vre_bwRoc <= 0
+vre_efficientMove = vre_effRatio > 0.35
+vre_inefficient = vre_effRatio <= 0.35
+
+vre_trendIgnition = vre_volExpanding and vre_intentStrong and vre_efficientMove
+vre_fakeBreakout = vre_volContracting and vre_intentStrong and vre_inefficient
+vre_meanReversion = vre_volContracting and vre_intentWeak and vre_inefficient
+vre_volatilityChurn = vre_volExpanding and vre_intentStrong and vre_inefficient
+
+int vre_regime_state = vre_trendIgnition ? 1 :
+  vre_fakeBreakout ? 2 :
+  vre_meanReversion ? 3 :
+  vre_volatilityChurn ? 4 : 0
+
+bool vre_actionable = vre_trendIgnition or vre_volatilityChurn or vre_meanReversion
+
+//════════════════════════════════════════════════════════════════════════════════
+// JMA/iTREND DIRECTION BIAS
+//════════════════════════════════════════════════════════════════════════════════
+
+dir_src = input.source(close, "Direction Source", group="Direction Bias (JMA/iTrend)")
+dir_jma_len = input.int(16, "Direction JMA Length", minval=1, group="Direction Bias (JMA/iTrend)")
+dir_jma_phase = input.int(40, "Direction JMA Phase", minval=-100, maxval=100, group="Direction Bias (JMA/iTrend)")
+dir_jma_power = input.int(2, "Direction JMA Power", minval=1, maxval=10, group="Direction Bias (JMA/iTrend)")
+dir_itrend_alpha = input.float(0.09, "Direction iTrend Alpha", step=0.01, group="Direction Bias (JMA/iTrend)")
+dir_accel_len = input.int(2, "Acceleration Smooth", minval=1, group="Direction Bias (JMA/iTrend)")
+dir_slope_len = input.int(2, "Slope Lookback", minval=1, group="Direction Bias (JMA/iTrend)")
+
+dir_use_cycle = input.bool(true, "Use Adaptive Cycle for Direction JMA", group="Direction Bias (JMA/iTrend)")
+dir_cycle_mult = input.float(0.3, "Direction Cycle Multiplier", minval=0.1, maxval=3.0, step=0.1, group="Direction Bias (JMA/iTrend)")
+dir_use_half_cycle = input.bool(true, "Use Half Cycle", group="Direction Bias (JMA/iTrend)")
+
+dir_entry_states = input.string("Strong + Weak Up", "Entry Allowed In States",
+  options=["Strong Up Only", "Strong + Weak Up", "Any Bullish (incl. Slowing)"], group="Direction Bias (JMA/iTrend)")
+dir_exit_states = input.string("Down + Slowing", "Exit Allowed In States",
+  options=["Down Only", "Down + Slowing", "Any Bearish (incl. Weak Up)"], group="Direction Bias (JMA/iTrend)")
+
+float dir_adaptive_len = dir_jma_len
+if dir_use_cycle
+    float raw_len = baseCycle * dir_cycle_mult
+    if dir_use_half_cycle
+        raw_len := raw_len / 2.0
+    dir_adaptive_len := math.max(4, math.round(raw_len))
+
+dir_jma(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jv = na
+    e0 := (1 - alpha) * src + alpha * nz(e0[1], src)
+    e1 := (src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jv[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jv := e2 + nz(jv[1], src)
+    jv
+
+dir_jma_line = dir_jma(dir_src, dir_adaptive_len, dir_jma_phase, dir_jma_power)
+
+dir_iTrend_func(src, alpha) =>
+    var float dit = na
+    dit := (alpha - (alpha * alpha) / 4) * src +
+      0.5 * alpha * alpha * nz(src[1]) -
+      (alpha - 0.75 * alpha * alpha) * nz(src[2]) +
+      2 * (1 - alpha) * nz(dit[1]) -
+      (1 - alpha) * (1 - alpha) * nz(dit[2])
+    dit
+
+dir_iTrend = dir_iTrend_func(dir_src, dir_itrend_alpha)
+dir_iTrend_cross = ta.cross(dir_iTrend, 0)
+
+dir_slope_raw = dir_jma_line - dir_jma_line[dir_slope_len]
+dir_accel_raw = dir_slope_raw - dir_slope_raw[1]
+dir_accel = ta.ema(dir_accel_raw, dir_accel_len)
+
+dir_slope_pos = dir_slope_raw > 0
+dir_slope_neg = dir_slope_raw < 0
+dir_accel_pos = dir_accel > 0
+dir_accel_neg = dir_accel < 0
+
+dir_strong_up = dir_slope_pos and dir_accel_pos
+dir_weak_up = dir_slope_pos and dir_accel_neg
+dir_slowing_dn = dir_slope_neg and dir_accel_pos
+dir_down = dir_slope_neg and dir_accel_neg
+
+dir_weakening = dir_accel < 0 or math.abs(dir_slope_raw) < math.abs(dir_slope_raw[1])
+dir_iTrend_early = dir_iTrend_cross and dir_weakening
+dir_iTrend_early_bull = dir_iTrend_early and dir_iTrend > 0
+dir_iTrend_early_bear = dir_iTrend_early and dir_iTrend < 0
+
+dir_entry_zone = (dir_entry_states == "Strong Up Only" and dir_strong_up) or
+  (dir_entry_states == "Strong + Weak Up" and (dir_strong_up or dir_weak_up)) or
+  (dir_entry_states == "Any Bullish (incl. Slowing)" and (dir_strong_up or dir_weak_up or dir_slowing_dn))
+
+dir_exit_zone = (dir_exit_states == "Down Only" and dir_down) or
+  (dir_exit_states == "Down + Slowing" and (dir_down or dir_slowing_dn)) or
+  (dir_exit_states == "Any Bearish (incl. Weak Up)" and (dir_down or dir_slowing_dn or dir_weak_up))
+
+var int dir_trade_state = 0
+if dir_strong_up
+    dir_trade_state := 2
+else if dir_weak_up
+    dir_trade_state := 1
+else if dir_slowing_dn
+    dir_trade_state := -1
+else if dir_down
+    dir_trade_state := -2
+if dir_iTrend_early_bull
+    dir_trade_state := 1
+else if dir_iTrend_early_bear
+    dir_trade_state := -1
+
+col_dir_strong_up = input.color(color.new(color.white, 0), "Strong Up Color", group="Direction Visuals")
+col_dir_weak_up = input.color(color.new(color.yellow, 0), "Weak Up Color", group="Direction Visuals")
+col_dir_slowing_dn = input.color(color.new(#00C3FF, 0), "Slowing Down Color", group="Direction Visuals")
+col_dir_down = input.color(color.new(#FF00D5, 0), "Down Color", group="Direction Visuals")
+
+dir_state_color = dir_strong_up ? col_dir_strong_up :
+  dir_weak_up ? col_dir_weak_up :
+  dir_slowing_dn ? col_dir_slowing_dn : col_dir_down
+
+//════════════════════════════════════════════════════════════════════════════════
+// URE ADVANCED ENGINE
+//════════════════════════════════════════════════════════════════════════════════
+
+grpURE_Core = "URE Musashi FDI Core"
+ure_len_musashi = input.int(5, "Musashi Window", minval=1, group=grpURE_Core)
+ure_multiscale = input.bool(true, "Use Multiscale", group=grpURE_Core)
+ure_len_short = input.int(3, "Musashi Short", minval=1, group=grpURE_Core)
+ure_len_long = input.int(10, "Musashi Long", minval=1, group=grpURE_Core)
+ure_weight_core = input.float(0.65, "Efficiency Weight", minval=0.0, maxval=1.0, step=0.05, group=grpURE_Core)
+ure_weight_entropy = input.float(0.35, "Entropy Weight", minval=0.0, maxval=1.0, step=0.05, group=grpURE_Core)
+ure_use_cfb = input.bool(true, "Use CFB (R²)", group=grpURE_Core)
+ure_cfb_short = input.int(3, "CFB Short", minval=1, group=grpURE_Core)
+ure_cfb_med = input.int(5, "CFB Medium", minval=1, group=grpURE_Core)
+ure_cfb_long = input.int(10, "CFB Long", minval=1, group=grpURE_Core)
+ure_adaptive_lookback = input.int(5, "Adaptive Lookback", minval=1, group=grpURE_Core)
+
+grpURE_ER = "URE Efficiency Ratio"
+ure_er_length = input.int(4, "ER Length", minval=1, group=grpURE_ER)
+ure_er_fast_length = input.int(5, "ER Fast JMA", minval=1, group=grpURE_ER)
+ure_er_slow_length = input.int(14, "ER Slow JMA", minval=1, group=grpURE_ER)
+ure_er_jma_phase = input.float(40, "ER JMA Phase", minval=-100, maxval=100, group=grpURE_ER)
+ure_er_jma_power = input.float(2, "ER JMA Power", minval=1, step=0.1, group=grpURE_ER)
+ure_er_strong_thr = input.float(0.45, "ER Strong", step=0.05, minval=0.0, maxval=1.0, group=grpURE_ER)
+ure_er_weak_thr = input.float(0.25, "ER Weak", step=0.05, minval=0.0, maxval=1.0, group=grpURE_ER)
+ure_er_elite_thr = input.float(0.65, "ER Elite", step=0.05, minval=0.0, maxval=1.0, group=grpURE_ER)
+
+grpURE_ATR = "URE ATR Volatility"
+ure_atr_length = input.int(7, "ATR Length", minval=1, group=grpURE_ATR)
+ure_atr_jma_length = input.int(16, "ATR JMA Length", minval=1, group=grpURE_ATR)
+ure_atr_jma_phase = input.float(40, "ATR JMA Phase", minval=-100, maxval=100, group=grpURE_ATR)
+ure_atr_jma_power = input.float(4, "ATR JMA Power", minval=1, step=0.1, group=grpURE_ATR)
+ure_vol_compressed_thr = input.float(2.0, "Compressed Threshold", step=0.05, minval=0.1, maxval=2.0, group=grpURE_ATR)
+ure_vol_expanded_thr = input.float(1.35, "Expanded Threshold", step=0.05, minval=0.1, maxval=2.0, group=grpURE_ATR)
+
+grpURE_Adv = "URE Advanced Engine"
+ure_process_noise = input.float(0.0618, "Process Noise", step=0.001, minval=0.001, maxval=0.1, group=grpURE_Adv)
+ure_measurement_noise = input.float(0.05, "Measurement Noise", step=0.01, minval=0.01, maxval=0.2, group=grpURE_Adv)
+ure_stress_lookback = input.int(4, "Stress Window", minval=0, maxval=50, group=grpURE_Adv)
+ure_stress_low = input.float(0.20, "Stable Threshold", step=0.05, minval=0.0, maxval=1.0, group=grpURE_Adv)
+ure_stress_medium = input.float(0.35, "Caution Threshold", step=0.05, minval=0.0, maxval=1.0, group=grpURE_Adv)
+ure_stress_high = input.float(0.50, "Danger Threshold", step=0.05, minval=0.0, maxval=1.0, group=grpURE_Adv)
+ure_adaptive_thresholds = input.bool(true, "Adaptive Thresholds", group=grpURE_Adv)
+ure_enable_micro = input.bool(true, "Microstructure", group=grpURE_Adv)
+ure_vol_accel_len = input.int(5, "Vol Surge Length", minval=2, group=grpURE_Adv)
+ure_vol_surge_mult = input.float(2.0, "Vol Surge Mult", step=0.5, minval=1.0, group=grpURE_Adv)
+
+grpURE_Thr = "URE Regime Thresholds"
+ure_trend_thr_base = input.float(0.50, "Trend Threshold", step=0.01, minval=0.4, maxval=1.0, group=grpURE_Thr)
+ure_range_thr_base = input.float(0.30, "Range Threshold", step=0.01, minval=0.0, maxval=0.5, group=grpURE_Thr)
+ure_min_confidence = input.float(0.50, "Minimum Confidence", step=0.05, minval=0.0, maxval=1.0, group=grpURE_Thr)
+ure_elite_confidence = input.float(0.70, "Elite Confidence", step=0.05, minval=0.0, maxval=1.0, group=grpURE_Thr)
+
+grpURE_Div = "URE Divergence"
+ure_enable_divergence = input.bool(true, "Enable Divergence Detection", group=grpURE_Div)
+ure_divergence_pivot_len = input.int(5, "Pivot Length", minval=2, maxval=20, group=grpURE_Div)
+ure_divergence_lookback = input.int(10, "Lookback Bars", minval=5, maxval=50, group=grpURE_Div)
+
+grpURE_Vis = "URE Visuals"
+col_ure_bullish = input.color(color.new(color.white, 0), "Bullish Fill (Elite+Trend+Ignition)", group=grpURE_Vis)
+col_ure_exhaustion = input.color(color.new(#FF00D5, 0), "EXHAUSTION Fill", group=grpURE_Vis)
+col_ure_flat = input.color(color.new(#00C3FF, 0), "FLAT Fill", group=grpURE_Vis)
+
+ure_shannon_entropy(src, length, bins) =>
+    ret = src - src[1]
+    lo = ta.lowest(ret, length)
+    hi = ta.highest(ret, length)
+    range_val = math.max(hi - lo, 1e-10)
+    counts = array.new_float(bins, 0.0)
+    for k = 0 to length - 1
+        r = ret[k]
+        idx = int(math.floor((r - lo) / range_val * bins))
+        idx := math.max(0, math.min(bins - 1, idx))
+        array.set(counts, idx, array.get(counts, idx) + 1.0)
+    ent = 0.0
+    total = float(length)
+    for i = 0 to bins - 1
+        p = array.get(counts, i) / total
+        if p > 1e-10
+            ent -= p * math.log(p)
+    maxEnt = math.log(bins)
+    normEnt = maxEnt == 0 ? 0.0 : ent / maxEnt
+    math.max(0.0, math.min(1.0, normEnt))
+
+ure_r_squared(src, length) =>
+    mean_x = (length - 1) / 2.0
+    mean_y = ta.sma(src, length)
+    num = 0.0
+    den = 0.0
+    for i = 0 to length - 1
+        xi = float(i) - mean_x
+        yi = src[i] - mean_y
+        num += xi * yi
+        den += xi * xi
+    slope = den == 0 ? 0.0 : num / den
+    ssr = 0.0
+    sst = 0.0
+    for i = 0 to length - 1
+        xi = float(i) - mean_x
+        pred = slope * xi + mean_y
+        ssr += math.pow(pred - mean_y, 2)
+        sst += math.pow(src[i] - mean_y, 2)
+    r2 = sst == 0 ? 0.0 : ssr / sst
+    math.max(0.0, math.min(1.0, r2))
+
+ure_percentile_normalize(val, lookback) =>
+    hi = ta.highest(val, lookback)
+    lo = ta.lowest(val, lookback)
+    range_val = hi - lo
+    normalized = range_val == 0 ? 0.5 : (val - lo) / range_val
+    math.max(0.0, math.min(1.0, normalized))
+
+ure_efficiency_ratio(src, w) =>
+    path = 0.0
+    for i = 0 to w - 1
+        path += math.abs(src[i] - src[i + 1])
+    disp = math.abs(src - src[w])
+    path := math.max(path, 1e-10)
+    eff = disp / path
+    math.max(0.0, math.min(1.0, eff))
+
+ure_kaufman_er(src, length) =>
+    change = math.abs(src - src[length])
+    volatility_sum = 0.0
+    for i = 0 to length - 1
+        volatility_sum += math.abs(src[i] - src[i + 1])
+    er = volatility_sum != 0 ? change / volatility_sum : 0.0
+    math.max(0.0, math.min(1.0, er))
+
+ure_jma_er_fast(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jv = na
+    e0 := (1 - alpha) * src + alpha * nz(e0[1], src)
+    e1 := (src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jv[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jv := e2 + nz(jv[1], src)
+    jv
+
+ure_jma_er_slow(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jv = na
+    e0 := (1 - alpha) * src + alpha * nz(e0[1], src)
+    e1 := (src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jv[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jv := e2 + nz(jv[1], src)
+    jv
+
+ure_jma_atr(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jv = na
+    e0 := (1 - alpha) * src + alpha * nz(e0[1], src)
+    e1 := (src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jv[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jv := e2 + nz(jv[1], src)
+    jv
+
+ure_musashi_fdi(src, w, use_ms, ws, wl, lookback, wc, we) =>
+    eff_med = ure_efficiency_ratio(src, w)
+    eff = eff_med
+    if use_ms
+        eff_short = ure_efficiency_ratio(src, ws)
+        eff_long = ure_efficiency_ratio(src, wl)
+        eff := 0.20 * eff_short + 0.60 * eff_med + 0.20 * eff_long
+    ent = ure_shannon_entropy(src, w, 8)
+    ent_inv = 1.0 - ent
+    fused = wc * eff + we * ent_inv
+    normalized = ure_percentile_normalize(fused, lookback)
+    math.max(0.0, math.min(1.0, normalized))
+
+ure_cfb_enhanced(src, shortW, medW, longW, lookback) =>
+    r2s = ure_r_squared(src, shortW)
+    r2m = ure_r_squared(src, medW)
+    r2l = ure_r_squared(src, longW)
+    blended = 0.2 * r2s + 0.6 * r2m + 0.2 * r2l
+    normalized = ure_percentile_normalize(blended, lookback)
+    math.max(0.0, math.min(1.0, normalized))
+
+ure_kalman_filter(measurement, proc_noise, meas_noise) =>
+    var float state = na
+    var float velocity = 0.0
+    var float uncertainty = 1.0
+    if na(state)
+        state := measurement
+        uncertainty := 1.0
+        velocity := 0.0
+    predicted_state = state + velocity
+    predicted_uncertainty = uncertainty + proc_noise
+    innovation = measurement - predicted_state
+    innovation_uncertainty = predicted_uncertainty + meas_noise
+    kalman_gain = predicted_uncertainty / innovation_uncertainty
+    state := predicted_state + kalman_gain * innovation
+    velocity := velocity + kalman_gain * innovation * 0.5
+    uncertainty := (1 - kalman_gain) * predicted_uncertainty
+    residual = measurement - predicted_state
+    [state, velocity, uncertainty, residual]
+
+ure_stress_detector(residual, lookback) =>
+    residuals = array.new_float(0)
+    for i = 0 to lookback - 1
+        array.push(residuals, residual[i])
+    n = array.size(residuals)
+    mean = array.avg(residuals)
+    variance = 0.0
+    for i = 0 to n - 1
+        dev = array.get(residuals, i) - mean
+        variance += dev * dev
+    variance := variance / n
+    std_dev = math.sqrt(math.max(variance, 1e-10))
+    skewness = 0.0
+    if std_dev > 1e-10
+        for i = 0 to n - 1
+            z = (array.get(residuals, i) - mean) / std_dev
+            skewness += z * z * z
+        skewness := skewness / n
+    kurtosis = 0.0
+    if std_dev > 1e-10
+        for i = 0 to n - 1
+            z = (array.get(residuals, i) - mean) / std_dev
+            kurtosis += z * z * z * z
+        kurtosis := kurtosis / n
+    excess_kurtosis = kurtosis - 3.0
+    skew_stress = math.min(math.abs(skewness) / 2.0, 1.0)
+    kurt_stress = math.min(math.abs(excess_kurtosis) / 3.0, 1.0)
+    stress = (skew_stress + kurt_stress) / 2.0
+    [skewness, excess_kurtosis, stress]
+
+ure_f_musashi = ure_musashi_fdi(close, ure_len_musashi, ure_multiscale, ure_len_short, ure_len_long,
+  ure_adaptive_lookback, ure_weight_core, ure_weight_entropy)
+
+ure_cfb_val = ure_use_cfb ? ure_cfb_enhanced(close, ure_cfb_short, ure_cfb_med, ure_cfb_long, ure_adaptive_lookback) : 0.0
+ure_composite_raw = ure_use_cfb ? (0.75 * ure_f_musashi + 0.25 * ure_cfb_val) : ure_f_musashi
+
+ure_independent_er = ure_kaufman_er(close, ure_er_length)
+ure_er_fast = ure_jma_er_fast(ure_independent_er, ure_er_fast_length, ure_er_jma_phase, ure_er_jma_power)
+ure_er_slow = ure_jma_er_slow(ure_independent_er, ure_er_slow_length, ure_er_jma_phase, ure_er_jma_power)
+
+ure_er_rising = ure_er_fast > ure_er_slow
+ure_er_falling = ure_er_fast < ure_er_slow
+ure_er_strong = ure_independent_er > ure_er_strong_thr and ure_er_rising
+ure_er_elite = ure_independent_er > ure_er_elite_thr
+
+ure_atr_val = ta.atr(ure_atr_length)
+ure_atr_jma_avg = ure_jma_atr(ure_atr_val, ure_atr_jma_length, ure_atr_jma_phase, ure_atr_jma_power)
+ure_atr_ratio = ure_atr_jma_avg != 0 ? ure_atr_val / ure_atr_jma_avg : 1.0
+ure_vol_compressed = ure_atr_ratio < ure_vol_compressed_thr
+
+float ure_vol_surge_score = 50.0
+if ure_enable_micro
+    ure_vol_avg = ta.sma(volume, ure_vol_accel_len)
+    ure_vol_surge = volume > (ure_vol_avg * ure_vol_surge_mult)
+    ure_vol_surge_bullish = ure_vol_surge and close > open
+    ure_vol_surge_score := ure_vol_surge_bullish ? 100.0 : 50.0
+
+[ure_kalman_state, ure_kalman_velocity, ure_kalman_uncertainty, ure_kalman_residual] =
+  ure_kalman_filter(ure_composite_raw, ure_process_noise, ure_measurement_noise)
+
+[ure_skewness, ure_excess_kurtosis, ure_stress_score] =
+  ure_stress_detector(ure_kalman_residual, ure_stress_lookback)
+
+float ure_adv_trend_thr = ure_trend_thr_base
+float ure_adv_range_thr = ure_range_thr_base
+if ure_adaptive_thresholds
+    ure_stress_adj = ure_stress_score * 0.15
+    ure_uncert_adj = ure_kalman_uncertainty * 0.10
+    ure_adv_trend_thr := ure_trend_thr_base + ure_stress_adj + ure_uncert_adj
+    ure_adv_range_thr := ure_range_thr_base - ure_stress_adj - ure_uncert_adj
+
+ure_advanced_regime = ure_kalman_state >= ure_adv_trend_thr ? "TREND" :
+  ure_kalman_state <= ure_adv_range_thr ? "RANGE" : "TRANSITION"
+
+ure_adv_thr_dist = ure_advanced_regime == "TREND" ?
+  (ure_kalman_state - ure_adv_trend_thr) / (1.0 - ure_adv_trend_thr) :
+  ure_advanced_regime == "RANGE" ?
+  (ure_adv_range_thr - ure_kalman_state) / ure_adv_range_thr : 0.5
+ure_adv_thr_dist := math.max(0.0, math.min(1.0, ure_adv_thr_dist))
+
+ure_adv_vol_conf = ure_atr_ratio < ure_vol_compressed_thr ? 1.0 :
+  ure_atr_ratio > ure_vol_expanded_thr ? 0.5 : 0.8
+ure_stress_conf = 1.0 - ure_stress_score
+
+ure_advanced_confidence = (0.35 * ure_adv_thr_dist) + (0.35 * ure_independent_er) +
+  (0.15 * ure_adv_vol_conf) + (0.15 * ure_stress_conf)
+ure_advanced_confidence := math.max(0.0, math.min(1.0, ure_advanced_confidence))
+
+ure_jma_bullish = dir_slope_pos
+
+var string ure_advanced_state = "NO_TRADE"
+if not ure_jma_bullish
+    ure_advanced_state := "NO_TRADE"
+else if ure_advanced_regime == "TREND" and ure_er_falling
+    ure_advanced_state := "EXHAUSTION"
+else if ure_advanced_regime == "TREND" and ure_er_elite and ure_advanced_confidence >= ure_elite_confidence
+    ure_advanced_state := "ELITE"
+else if ure_advanced_regime == "TREND" and ure_er_strong and ure_advanced_confidence >= ure_min_confidence
+    ure_advanced_state := "TREND"
+else if ure_jma_bullish and ure_er_rising and ure_vol_compressed and ure_kalman_state > (ure_adv_range_thr + 0.10)
+    ure_advanced_state := "IGNITION"
+else
+    ure_advanced_state := "NO_TRADE"
+
+// URE fill: Elite + Trend + Ignition = one bullish color
+bool ure_is_bullish = ure_advanced_state == "ELITE" or ure_advanced_state == "TREND" or ure_advanced_state == "IGNITION"
+
+color ure_fill_color = ure_is_bullish ? col_ure_bullish :
+  ure_advanced_state == "EXHAUSTION" ? col_ure_exhaustion :
+  col_ure_flat
+
+ure_pivot_high_price = ta.pivothigh(close, ure_divergence_pivot_len, ure_divergence_pivot_len)
+ure_pivot_high_adv = ta.pivothigh(ure_kalman_state, ure_divergence_pivot_len, ure_divergence_pivot_len)
+ure_pivot_low_price = ta.pivotlow(close, ure_divergence_pivot_len, ure_divergence_pivot_len)
+ure_pivot_low_adv = ta.pivotlow(ure_kalman_state, ure_divergence_pivot_len, ure_divergence_pivot_len)
+
+ure_bear_div = ure_enable_divergence and not na(ure_pivot_high_price) and not na(ure_pivot_high_adv) and
+  close[ure_divergence_pivot_len] > close[ure_divergence_pivot_len + ure_divergence_lookback] and
+  ure_kalman_state[ure_divergence_pivot_len] < ure_kalman_state[ure_divergence_pivot_len + ure_divergence_lookback]
+
+ure_bull_div = ure_enable_divergence and not na(ure_pivot_low_price) and not na(ure_pivot_low_adv) and
+  close[ure_divergence_pivot_len] < close[ure_divergence_pivot_len + ure_divergence_lookback] and
+  ure_kalman_state[ure_divergence_pivot_len] > ure_kalman_state[ure_divergence_pivot_len + ure_divergence_lookback]
+
+//════════════════════════════════════════════════════════════════════════════════
+// ADAPTIVE TRAILING STOP ENGINE v3.0 (Ehlers Cycle — 3 adaptive lengths)
+//════════════════════════════════════════════════════════════════════════════════
+
+grpTrailCycle = "Trail Stop — Ehlers Cycle"
+ts_useAdaptiveLen = input.bool(true, "Enable Adaptive Lengths", group=grpTrailCycle,
+  tooltip="When enabled, JMA, MAD, and ADX/ER lengths all adapt to the dominant cycle")
+ts_staticJmaLen = input.int(16, "Static JMA Length", minval=1, group=grpTrailCycle)
+ts_staticVolLen = input.int(7, "Static MAD Length", minval=1, group=grpTrailCycle)
+ts_staticAdxLen = input.int(7, "Static ADX/ER Length", minval=1, group=grpTrailCycle)
+ts_minPeriod = input.int(5, "Min Cycle Period", minval=4, group=grpTrailCycle)
+ts_maxPeriod = input.int(16, "Max Cycle Period", minval=10, group=grpTrailCycle)
+ts_cycleMethod = input.string("Autocorrelation", "Cycle Method",
+  options=["Autocorrelation", "Hilbert"], group=grpTrailCycle)
+
+grpTrailMult = "Trail Stop — Cycle Multipliers"
+ts_jmaCycleMult = input.float(0.5, "JMA Price Cycle Mult", minval=0.1, maxval=2.0, step=0.05, group=grpTrailMult,
+  tooltip="JMA length = smoothedCycle × this. 0.5 = half cycle (Ehlers recommended)")
+ts_volCycleMult = input.float(0.5, "MAD Volatility Cycle Mult", minval=0.1, maxval=2.0, step=0.05, group=grpTrailMult,
+  tooltip="MAD length = smoothedCycle × this. 0.5 = capture one volatility swing")
+ts_adxCycleMult = input.float(0.5, "ADX/ER Cycle Mult", minval=0.1, maxval=2.0, step=0.05, group=grpTrailMult,
+  tooltip="ADX/ER length = smoothedCycle × this. 0.5–0.75 recommended")
+ts_minAdaptiveLen = input.int(3, "Min Adaptive Length (all)", minval=2, maxval=10, group=grpTrailMult)
+
+grpTrailSmooth = "Trail Stop — Cycle Smoothing"
+ts_cycleSmoothMethod = input.string("JMA", "Smooth Method",
+  options=["JMA", "EMA", "SuperSmoother", "None"], group=grpTrailSmooth)
+ts_cycleSmoothLen = input.int(16, "Smooth Length", minval=2, group=grpTrailSmooth)
+ts_cycleJmaPhase = input.float(40, "Cycle JMA Phase", minval=-100, maxval=100, group=grpTrailSmooth)
+ts_cycleJmaPower = input.float(4.0, "Cycle JMA Power", minval=1, maxval=10, step=0.1, group=grpTrailSmooth)
+
+grpTrailJMA = "Trail Stop — JMA"
+ts_jmaPhase = input.float(40, "JMA Phase", minval=-100, maxval=100, group=grpTrailJMA)
+ts_jmaPower = input.float(4.0, "JMA Power", minval=1, step=0.1, group=grpTrailJMA)
+
+grpTrailState = "Trail Stop — State Machine"
+ts_itrend_alpha = input.float(0.09, "iTrend Alpha", step=0.01, group=grpTrailState)
+ts_accel_len = input.int(2, "Acceleration Smooth", minval=1, group=grpTrailState)
+ts_slope_len = input.int(2, "Slope Lookback", minval=1, group=grpTrailState)
+
+grpTrailBlend = "Trail Stop — State Blending"
+ts_state_weight = input.float(0.5, "State Machine Weight", minval=0.0, maxval=1.0, step=0.05, group=grpTrailBlend)
+ts_strong_up_factor = input.float(0.5, "Strong Up → Tightness", minval=0.0, maxval=1.0, step=0.05, group=grpTrailBlend)
+ts_weak_up_factor = input.float(0.5, "Weak Up → Tightness", minval=0.0, maxval=1.0, step=0.05, group=grpTrailBlend)
+ts_slowing_dn_factor = input.float(1.0, "Slowing Dn → Tightness", minval=0.0, maxval=1.0, step=0.05, group=grpTrailBlend)
+ts_down_factor = input.float(1.0, "Down → Tightness", minval=0.0, maxval=1.0, step=0.05, group=grpTrailBlend)
+ts_itrend_early_factor = input.float(0.05, "iTrend Early → Tightness", minval=0.0, maxval=1.0, step=0.05, group=grpTrailBlend)
+
+grpTrailVol = "Trail Stop — Volatility"
+ts_baseMultiplier = input.float(0.8, "Base Multiplier", minval=0.1, step=0.1, group=grpTrailVol)
+
+grpTrailAdapt = "Trail Stop — Adaptive"
+ts_adxWeight = input.float(0.5, "ADX Weight", minval=0.0, maxval=1.0, step=0.1, group=grpTrailAdapt)
+ts_adaptiveSensitivity = input.float(1.0, "Sensitivity", minval=0.1, maxval=5.0, step=0.1, group=grpTrailAdapt)
+ts_minMultiplier = input.float(0.3, "Min Multiplier", minval=0.1, step=0.1, group=grpTrailAdapt)
+ts_maxMultiplier = input.float(6.0, "Max Multiplier", minval=0.1, step=0.1, group=grpTrailAdapt)
+ts_smoothAdaptive = input.bool(true, "Smooth Adaptive Signal", group=grpTrailAdapt)
+ts_smoothLength = input.int(3, "Smoothing Length", minval=1, group=grpTrailAdapt)
+
+grpTrailVis = "Trail Stop — Visuals"
+ts_col_buy = input.color(color.new(color.white, 0), "Buy Signal Color", group=grpTrailVis)
+ts_col_sell = input.color(color.new(#FF00D5, 0), "Sell Signal Color", group=grpTrailVis)
+
+// --- Ehlers Autocorrelation ---
+ts_ehlers_autocorrelation(src, minP, maxP) =>
+    float hp = na
+    float a1_hp = math.exp(-math.sqrt(2.0) * math.pi / maxP)
+    float b1_hp = 2.0 * a1_hp * math.cos(math.sqrt(2.0) * math.pi / maxP)
+    float hp_c2 = b1_hp
+    float hp_c3 = -(a1_hp * a1_hp)
+    float hp_c1 = (1.0 + hp_c2 - hp_c3) / 4.0
+    hp := bar_index < 3 ? 0.0 :
+      hp_c1 * (src - 2.0 * nz(src[1]) + nz(src[2])) + hp_c2 * nz(hp[1]) + hp_c3 * nz(hp[2])
+    float filt = na
+    float a1_ss = math.exp(-math.sqrt(2.0) * math.pi / (0.5 * maxP))
+    float b1_ss = 2.0 * a1_ss * math.cos(math.sqrt(2.0) * math.pi / (0.5 * maxP))
+    float ss_c2 = b1_ss
+    float ss_c3 = -(a1_ss * a1_ss)
+    float ss_c1 = 1.0 - ss_c2 - ss_c3
+    filt := bar_index < 3 ? 0.0 :
+      ss_c1 * (hp + nz(hp[1])) * 0.5 + ss_c2 * nz(filt[1]) + ss_c3 * nz(filt[2])
+    float maxPower = 0.0
+    float dominantPeriod = 0.0
+    int avgLen = maxP
+    for period = minP to maxP
+        float cosinePart = 0.0
+        float sinePart = 0.0
+        for n = 0 to avgLen - 1
+            angle = 2.0 * math.pi * n / period
+            cosinePart += nz(filt[n]) * math.cos(angle)
+            sinePart += nz(filt[n]) * math.sin(angle)
+        float power = cosinePart * cosinePart + sinePart * sinePart
+        if power > maxPower
+            maxPower := power
+            dominantPeriod := period
+    dominantPeriod
+
+// --- Ehlers Hilbert ---
+ts_ehlers_hilbert(src, minP, maxP) =>
+    var float smooth_val = na
+    smooth_val := (4.0 * src + 3.0 * nz(src[1]) + 2.0 * nz(src[2]) + nz(src[3])) / 10.0
+    var float detrender = na
+    detrender := (0.0962 * smooth_val + 0.5769 * nz(smooth_val[2]) -
+      0.5769 * nz(smooth_val[4]) - 0.0962 * nz(smooth_val[6])) *
+      (0.075 * nz(smooth_val[1]) + 0.54)
+    var float I1 = na
+    var float Q1 = na
+    I1 := nz(detrender[3])
+    Q1 := (0.0962 * detrender + 0.5769 * nz(detrender[2]) -
+      0.5769 * nz(detrender[4]) - 0.0962 * nz(detrender[6])) *
+      (0.075 * nz(detrender[1]) + 0.54)
+    var float I2 = na
+    var float Q2 = na
+    I2 := I1 - 0.25 * Q1
+    Q2 := 0.25 * I1 + Q1
+    I2 := 0.2 * I2 + 0.8 * nz(I2[1])
+    Q2 := 0.2 * Q2 + 0.8 * nz(Q2[1])
+    var float period_raw = na
+    if I2 != 0 and Q2 != 0
+        period_raw := 2.0 * math.pi / math.atan(Q2 / I2)
+    float clamped = math.max(minP, math.min(maxP, nz(period_raw, (minP + maxP) / 2)))
+    var float smoothed_period = na
+    smoothed_period := 0.2 * clamped + 0.8 * nz(smoothed_period[1], clamped)
+    smoothed_period
+
+// --- Cycle Smoothing ---
+ts_jma_cycle_smooth(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float c_e0 = na
+    var float c_e1 = na
+    var float c_e2 = na
+    var float c_jv = na
+    c_e0 := (1 - alpha) * src + alpha * nz(c_e0[1], src)
+    c_e1 := (src - c_e0) * (1 - beta) + beta * nz(c_e1[1], 0)
+    c_e2 := (c_e0 + phaseRatio * c_e1 - nz(c_jv[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(c_e2[1], 0)
+    c_jv := c_e2 + nz(c_jv[1], src)
+    c_jv
+
+ts_supersmoother(src, length) =>
+    a1 = math.exp(-math.sqrt(2.0) * math.pi / length)
+    b1 = 2.0 * a1 * math.cos(math.sqrt(2.0) * math.pi / length)
+    c2 = b1
+    c3 = -(a1 * a1)
+    c1 = 1.0 - c2 - c3
+    var float ss = na
+    ss := na(ss[1]) or na(ss[2]) ? src :
+      c1 * (src + nz(src[1])) * 0.5 + c2 * nz(ss[1]) + c3 * nz(ss[2])
+    ss
+
+// --- Dominant Cycle → Three Adaptive Lengths ---
+float ts_rawCycle = na
+if ts_useAdaptiveLen
+    ts_rawCycle := ts_cycleMethod == "Autocorrelation" ?
+      ts_ehlers_autocorrelation(close, ts_minPeriod, ts_maxPeriod) :
+      ts_ehlers_hilbert(close, ts_minPeriod, ts_maxPeriod)
+
+float ts_smoothedCycle = na
+if not ts_useAdaptiveLen
+    ts_smoothedCycle := float(ts_staticJmaLen)
+else if ts_cycleSmoothMethod == "JMA"
+    ts_smoothedCycle := ts_jma_cycle_smooth(ts_rawCycle, ts_cycleSmoothLen, ts_cycleJmaPhase, ts_cycleJmaPower)
+else if ts_cycleSmoothMethod == "EMA"
+    ts_smoothedCycle := ta.ema(ts_rawCycle, ts_cycleSmoothLen)
+else if ts_cycleSmoothMethod == "SuperSmoother"
+    ts_smoothedCycle := ts_supersmoother(ts_rawCycle, ts_cycleSmoothLen)
+else
+    ts_smoothedCycle := ts_rawCycle
+
+float ts_adaptiveJmaLen = na
+float ts_adaptiveVolLen = na
+float ts_adaptiveAdxLen = na
+
+if ts_useAdaptiveLen
+    float jmaTarget = ts_smoothedCycle * ts_jmaCycleMult
+    ts_adaptiveJmaLen := math.round(math.max(ts_minAdaptiveLen, math.min(ts_maxPeriod, jmaTarget)))
+    float volTarget = ts_smoothedCycle * ts_volCycleMult
+    ts_adaptiveVolLen := math.round(math.max(ts_minAdaptiveLen, math.min(ts_maxPeriod, volTarget)))
+    float adxTarget = ts_smoothedCycle * ts_adxCycleMult
+    ts_adaptiveAdxLen := math.round(math.max(ts_minAdaptiveLen, math.min(ts_maxPeriod, adxTarget)))
+else
+    ts_adaptiveJmaLen := float(ts_staticJmaLen)
+    ts_adaptiveVolLen := float(ts_staticVolLen)
+    ts_adaptiveAdxLen := float(ts_staticAdxLen)
+
+int ts_intVolLen = int(ts_adaptiveVolLen)
+int ts_intAdxLen = int(ts_adaptiveAdxLen)
+
+// --- JMA Price (independent) ---
+ts_jma_price(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float p_e0 = na
+    var float p_e1 = na
+    var float p_e2 = na
+    var float p_jv = na
+    p_e0 := (1 - alpha) * src + alpha * nz(p_e0[1], src)
+    p_e1 := (src - p_e0) * (1 - beta) + beta * nz(p_e1[1], 0)
+    p_e2 := (p_e0 + phaseRatio * p_e1 - nz(p_jv[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(p_e2[1], 0)
+    p_jv := p_e2 + nz(p_jv[1], src)
+    p_jv
+
+ts_jmaLine = ts_jma_price(close, ts_adaptiveJmaLen, ts_jmaPhase, ts_jmaPower)
+
+// --- iTrend (independent) ---
+ts_iTrend_func(src, alpha) =>
+    var float it = na
+    it := (alpha - (alpha * alpha) / 4) * src +
+      0.5 * alpha * alpha * nz(src[1]) -
+      (alpha - 0.75 * alpha * alpha) * nz(src[2]) +
+      2 * (1 - alpha) * nz(it[1]) -
+      (1 - alpha) * (1 - alpha) * nz(it[2])
+    it
+
+ts_iTrend = ts_iTrend_func(close, ts_itrend_alpha)
+ts_iTrend_cross = ta.cross(ts_iTrend, 0)
+
+// --- State Machine (independent) ---
+ts_slope_raw = ts_jmaLine - ts_jmaLine[ts_slope_len]
+ts_accel_raw = ts_slope_raw - ts_slope_raw[1]
+ts_accel = ta.ema(ts_accel_raw, ts_accel_len)
+
+ts_slope_pos = ts_slope_raw > 0
+ts_slope_neg = ts_slope_raw < 0
+ts_accel_pos = ts_accel > 0
+ts_accel_neg = ts_accel < 0
+
+ts_green = ts_slope_pos and ts_accel_pos
+ts_yellow = ts_slope_pos and ts_accel_neg
+ts_blue = ts_slope_neg and ts_accel_pos
+ts_red = ts_slope_neg and ts_accel_neg
+
+ts_weakening = ts_accel < 0 or math.abs(ts_slope_raw) < math.abs(ts_slope_raw[1])
+ts_iTrend_early = ts_iTrend_cross and ts_weakening
+
+ts_stateFactor = ts_iTrend_early ? ts_itrend_early_factor :
+  ts_green ? ts_strong_up_factor :
+  ts_yellow ? ts_weak_up_factor :
+  ts_blue ? ts_slowing_dn_factor :
+  ts_down_factor
+
+// --- MAD Volatility (cycle-adaptive) ---
+ts_getMAD(length) =>
+    median = ta.median(close, length)
+    sum = 0.0
+    for i = 0 to length - 1
+        sum += math.abs(close[i] - median)
+    sum / length
+
+ts_volatility = ts_getMAD(ts_intVolLen)
+
+// --- ADX + ER (cycle-adaptive, series-compatible) ---
+ts_calcER(length) =>
+    change = math.abs(close - close[length])
+    volatilitySum = 0.0
+    for i = 0 to length - 1
+        volatilitySum += math.abs(close[i] - close[i + 1])
+    er = volatilitySum != 0 ? change / volatilitySum : 0
+    math.min(er, 1.0)
+
+ts_series_rma(src, length) =>
+    float alpha = 1.0 / math.max(length, 1)
+    var float rma_val = na
+    rma_val := na(rma_val[1]) ? src : alpha * src + (1.0 - alpha) * nz(rma_val[1])
+    rma_val
+
+float ts_tr_raw = math.max(high - low, math.max(math.abs(high - nz(close[1])), math.abs(low - nz(close[1]))))
+float ts_plus_dm_raw = high - nz(high[1]) > nz(low[1]) - low and high - nz(high[1]) > 0 ? high - nz(high[1]) : 0.0
+float ts_minus_dm_raw = nz(low[1]) - low > high - nz(high[1]) and nz(low[1]) - low > 0 ? nz(low[1]) - low : 0.0
+
+float ts_adx_smooth_tr = ts_series_rma(ts_tr_raw, ts_intAdxLen)
+float ts_adx_smooth_plus = ts_series_rma(ts_plus_dm_raw, ts_intAdxLen)
+float ts_adx_smooth_minus = ts_series_rma(ts_minus_dm_raw, ts_intAdxLen)
+
+float ts_di_plus = ts_adx_smooth_tr != 0 ? ts_adx_smooth_plus / ts_adx_smooth_tr * 100 : 0.0
+float ts_di_minus = ts_adx_smooth_tr != 0 ? ts_adx_smooth_minus / ts_adx_smooth_tr * 100 : 0.0
+
+float ts_dx_val = (ts_di_plus + ts_di_minus) != 0 ? math.abs(ts_di_plus - ts_di_minus) / (ts_di_plus + ts_di_minus) * 100 : 0.0
+float ts_adx_final = ts_series_rma(ts_dx_val, ts_intAdxLen)
+
+ts_erValue = ts_calcER(ts_intAdxLen)
+ts_adxValue = math.min(ts_adx_final / 100, 1.0)
+
+ts_adaptiveRaw = ts_adxValue * ts_adxWeight + ts_erValue * (1 - ts_adxWeight)
+ts_adaptiveSmoothed = ts_smoothAdaptive ? ta.ema(ts_adaptiveRaw, ts_smoothLength) : ts_adaptiveRaw
+ts_adaptiveNorm = math.min(ts_adaptiveSmoothed * ts_adaptiveSensitivity, 1.0)
+
+// --- Blended Signal + Trailing Logic ---
+ts_blendedAdaptive = ts_adaptiveNorm * (1.0 - ts_state_weight) + ts_stateFactor * ts_state_weight
+ts_adaptiveMultiplier = ts_maxMultiplier - (ts_maxMultiplier - ts_minMultiplier) * ts_blendedAdaptive
+ts_finalMultiplier = ts_baseMultiplier * ts_adaptiveMultiplier
+
+ts_longStop = ts_jmaLine - ts_volatility * ts_finalMultiplier
+ts_shortStop = ts_jmaLine + ts_volatility * ts_finalMultiplier
+
+var float ts_trailStop = na
+var int ts_trend = 0
+
+if na(ts_trailStop[1])
+    ts_trailStop := ts_longStop
+    ts_trend := 1
+else
+    if close > ts_trailStop[1] and close[1] > ts_trailStop[1]
+        ts_trend := 1
+        ts_trailStop := math.max(ts_longStop, ts_trailStop[1])
+    else if close < ts_trailStop[1] and close[1] < ts_trailStop[1]
+        ts_trend := -1
+        ts_trailStop := math.min(ts_shortStop, ts_trailStop[1])
+    else if close > ts_trailStop[1]
+        ts_trend := 1
+        ts_trailStop := ts_longStop
+    else
+        ts_trend := -1
+        ts_trailStop := ts_shortStop
+
+// Raw trail signals
+ts_buyRaw = ts_trend != ts_trend[1] and ts_trend == 1
+ts_sellRaw = ts_trend != ts_trend[1] and ts_trend == -1
+
+//════════════════════════════════════════════════════════════════════════════════
+// IVR — INSTITUTIONAL VOLUME REGIME ENGINE
+//════════════════════════════════════════════════════════════════════════════════
+
+grpIVR = "IVR Settings"
+ivr_fast_len = input.int(5, "IVR Fast JMA Length", minval=2, group=grpIVR)
+ivr_slow_len = input.int(16, "IVR Slow JMA Length", minval=5, group=grpIVR)
+ivr_phase = input.int(40, "IVR JMA Phase", minval=-100, maxval=100, group=grpIVR)
+ivr_power = input.int(2, "IVR JMA Power", minval=1, maxval=8, group=grpIVR)
+ivr_vol_lookback = input.int(3, "IVR ATR/MAD Lookback", minval=1, group=grpIVR)
+ivr_persistence = input.int(1, "Regime Persistence Bars", minval=1, maxval=20, group=grpIVR)
+
+grpIVRDiv = "IVR Divergences"
+ivr_use_div = input.bool(true, "Enable IVR Divergences", group=grpIVRDiv)
+ivr_pivot_len = input.int(4, "IVR Pivot Strength", minval=2, group=grpIVRDiv)
+ivr_min_sep = input.int(8, "Min Pivot Separation", minval=5, group=grpIVRDiv)
+
+ivr_struct_fast_calc(src, length, ph, pw) =>
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, pw)
+    var float sf_e0 = 0.0
+    var float sf_e1 = 0.0
+    sf_e0 := (1 - alpha) * src + alpha * nz(sf_e0[1])
+    sf_e1 := (src - sf_e0) * (1 - beta) + beta * nz(sf_e1[1])
+    sf_e0 + ph / 100.0 * sf_e1
+
+ivr_struct_slow_calc(src, length, ph, pw) =>
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, pw)
+    var float ss_e0 = 0.0
+    var float ss_e1 = 0.0
+    ss_e0 := (1 - alpha) * src + alpha * nz(ss_e0[1])
+    ss_e1 := (src - ss_e0) * (1 - beta) + beta * nz(ss_e1[1])
+    ss_e0 + ph / 100.0 * ss_e1
+
+ivr_eff_fast_calc(src, length, ph, pw) =>
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, pw)
+    var float ef_e0 = 0.0
+    var float ef_e1 = 0.0
+    ef_e0 := (1 - alpha) * src + alpha * nz(ef_e0[1])
+    ef_e1 := (src - ef_e0) * (1 - beta) + beta * nz(ef_e1[1])
+    ef_e0 + ph / 100.0 * ef_e1
+
+ivr_eff_slow_calc(src, length, ph, pw) =>
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, pw)
+    var float es_e0 = 0.0
+    var float es_e1 = 0.0
+    es_e0 := (1 - alpha) * src + alpha * nz(es_e0[1])
+    es_e1 := (src - es_e0) * (1 - beta) + beta * nz(es_e1[1])
+    es_e0 + ph / 100.0 * es_e1
+
+ivr_normalize(src, length) =>
+    m = ta.sma(src, length)
+    s = ta.stdev(src, length)
+    s != 0 ? (src - m) / s : 0.0
+
+ivr_percentile(src, length) =>
+    if length < 2
+        na
+    else
+        cnt = 0.0
+        for i = 0 to length - 1
+            cnt += src > src[i] ? 1 : 0
+        100.0 * cnt / length
+
+ivr_soft_clamp(x) =>
+    2.0 / (1.0 + math.exp(-2.0 * x)) - 1.0
+
+ivr_emaVol = ta.ema(volume, 20)
+ivr_rvol = ivr_emaVol > 0 ? volume / ivr_emaVol : 0.0
+ivr_rvol_z = ivr_normalize(ivr_rvol, 50)
+ivr_vol_struct_raw = 0.5 * ivr_rvol + 0.5 * ivr_rvol_z
+
+ivr_struct_fast = ivr_struct_fast_calc(ivr_vol_struct_raw, ivr_fast_len, ivr_phase, ivr_power)
+ivr_struct_slow = ivr_struct_slow_calc(ivr_vol_struct_raw, ivr_slow_len, ivr_phase, ivr_power)
+ivr_struct_raw = ivr_struct_fast - ivr_struct_slow
+ivr_struct_pressure = ivr_normalize(ivr_struct_raw, 40)
+
+ivr_atr = ta.atr(14)
+ivr_price_delta = close - close[1]
+ivr_eff_raw = (ivr_atr > 0 and ivr_rvol > 0) ? (ivr_price_delta / ivr_atr) / ivr_rvol : 0.0
+
+ivr_eff_fast = ivr_eff_fast_calc(ivr_eff_raw, ivr_fast_len, ivr_phase, ivr_power)
+ivr_eff_slow = ivr_eff_slow_calc(ivr_eff_raw, ivr_slow_len, ivr_phase, ivr_power)
+ivr_eff_raw_spread = ivr_eff_fast - ivr_eff_slow
+ivr_eff_pressure = ivr_normalize(ivr_eff_raw_spread, 40)
+
+ivr_atr_pct = ivr_percentile(ivr_atr, ivr_vol_lookback)
+ivr_median_atr = ta.median(ivr_atr, ivr_vol_lookback)
+ivr_mad_atr = ta.median(math.abs(ivr_atr - ivr_median_atr), ivr_vol_lookback)
+ivr_mad_pct = ivr_percentile(ivr_mad_atr, ivr_vol_lookback)
+ivr_volatility_score = 0.5 * ivr_atr_pct + 0.5 * ivr_mad_pct
+ivr_volatility_norm = na(ivr_volatility_score) ? 0.0 : (ivr_volatility_score - 50) / 50
+
+ivr_inst_pressure = (0.5 * ivr_eff_pressure + 0.3 * ivr_struct_pressure + 0.2 * ivr_volatility_norm)
+ivr_inst_norm = 100 * ivr_soft_clamp(ivr_inst_pressure)
+
+ivr_compression = math.abs(ivr_struct_pressure) < 0.10 and math.abs(ivr_eff_pressure) < 0.10
+ivr_markup = ivr_struct_pressure > 0.15 and ivr_eff_pressure > 0.15
+ivr_markdown = ivr_struct_pressure > 0.15 and ivr_eff_pressure < -0.15
+ivr_accum = ivr_struct_pressure > 0.15 and math.abs(ivr_eff_pressure) < 0.10
+ivr_liquidity = ivr_struct_pressure < -0.15 and math.abs(ivr_eff_pressure) > 0.15
+
+ivr_regime_raw = ivr_compression ? 0 :
+  ivr_accum ? 1 :
+  ivr_markup ? 2 :
+  ivr_markdown ? 4 :
+  ivr_liquidity ? 5 : 3
+
+var int ivr_regime_state = na
+var int ivr_regime_candidate = na
+var int ivr_regime_count = 0
+
+if ivr_regime_raw != ivr_regime_candidate
+    ivr_regime_candidate := ivr_regime_raw
+    ivr_regime_count := 1
+else
+    ivr_regime_count += 1
+if ivr_regime_count >= ivr_persistence
+    ivr_regime_state := ivr_regime_candidate
+if na(ivr_regime_state)
+    ivr_regime_state := ivr_regime_raw
+
+regime_is_accum = ivr_regime_state == 1
+regime_is_markup = ivr_regime_state == 2
+regime_is_markdown = ivr_regime_state == 4
+regime_is_liquidity = ivr_regime_state == 5
+regime_is_compression = ivr_regime_state == 0
+regime_is_neutral = ivr_regime_state == 3
+regime_is_favorable = regime_is_accum or regime_is_markup
+
+ivr_compression_to_accum = ivr_regime_state == 1 and ivr_regime_state[1] == 0
+ivr_accum_to_markup = ivr_regime_state == 2 and ivr_regime_state[1] == 1
+ivr_markup_to_markdown = ivr_regime_state == 4 and ivr_regime_state[1] == 2
+
+ivr_bull_div = false
+ivr_bear_div = false
+
+if ivr_use_div
+    ivr_pl_p = ta.pivotlow(close, ivr_pivot_len, ivr_pivot_len)
+    ivr_ph_p = ta.pivothigh(close, ivr_pivot_len, ivr_pivot_len)
+    ivr_pl_i = ta.pivotlow(ivr_inst_norm, ivr_pivot_len, ivr_pivot_len)
+    ivr_ph_i = ta.pivothigh(ivr_inst_norm, ivr_pivot_len, ivr_pivot_len)
+
+    var int bars_since_last_pl = 0
+    var int bars_since_last_ph = 0
+    bars_since_last_pl := not na(ivr_pl_p) ? 0 : bars_since_last_pl + 1
+    bars_since_last_ph := not na(ivr_ph_p) ? 0 : bars_since_last_ph + 1
+
+    ivr_bull_div := not na(ivr_pl_p) and not na(ivr_pl_i) and
+      bars_since_last_pl >= ivr_min_sep and
+      close[ivr_pivot_len] < close[ivr_pivot_len * 2] and
+      ivr_inst_norm[ivr_pivot_len] > ivr_inst_norm[ivr_pivot_len * 2]
+
+    ivr_bear_div := not na(ivr_ph_p) and not na(ivr_ph_i) and
+      bars_since_last_ph >= ivr_min_sep and
+      close[ivr_pivot_len] > close[ivr_pivot_len * 2] and
+      ivr_inst_norm[ivr_pivot_len] < ivr_inst_norm[ivr_pivot_len * 2]
+
+//════════════════════════════════════════════════════════════════════════════════
+// 5-COMPONENT SCORE ENGINE — ENTRIES
+//════════════════════════════════════════════════════════════════════════════════
+
+// Each component is a simple boolean vote (true = 1 point)
+bool sc_wae = trendUp > DEAD_ZONE
+bool sc_ivr = regime_is_accum or regime_is_markup
+bool sc_vre = vre_trendIgnition or vre_volatilityChurn
+bool sc_jma = dir_strong_up or dir_slowing_dn
+bool sc_ure = ure_advanced_state != "EXHAUSTION"
+
+// Gate: must have at least WAE or IVR to count
+bool sc_gate = sc_wae or sc_ivr
+
+// Score: simple vote count 0-5
+int sc_score = (sc_wae ? 1 : 0) + (sc_ivr ? 1 : 0) + (sc_vre ? 1 : 0) + (sc_jma ? 1 : 0) + (sc_ure ? 1 : 0)
+
+// Gated score: 0 if gate fails
+int sc_gated = sc_gate ? sc_score : 0
+
+//════════════════════════════════════════════════════════════════════════════════
+// 5-COMPONENT SCORE ENGINE — EXITS
+//════════════════════════════════════════════════════════════════════════════════
+
+// Exit mirror: bearish versions of each component
+bool sx_wae = trendDown > DEAD_ZONE
+bool sx_ivr = regime_is_markdown or regime_is_liquidity
+bool sx_vre = vre_meanReversion or vre_fakeBreakout
+bool sx_jma = dir_down or dir_weak_up
+bool sx_ure = ure_advanced_state == "EXHAUSTION"
+
+bool sx_gate = sx_wae or sx_ivr
+
+int sx_score = (sx_wae ? 1 : 0) + (sx_ivr ? 1 : 0) + (sx_vre ? 1 : 0) + (sx_jma ? 1 : 0) + (sx_ure ? 1 : 0)
+
+int sx_gated = sx_gate ? sx_score : 0
+
+//════════════════════════════════════════════════════════════════════════════════
+// TRAIL STOP: RAW BUY/SELL SIGNALS (no confluence filtering in v5.9)
+//════════════════════════════════════════════════════════════════════════════════
+
+bool ts_buySignal = ts_buyRaw
+bool ts_sellSignal = ts_sellRaw
+
+//════════════════════════════════════════════════════════════════════════════════
+// CAUTION SCORING SYSTEM
+//════════════════════════════════════════════════════════════════════════════════
+
+grpCaution = "Caution System"
+caution_mild_thresh = input.float(25.0, "Mild Caution Threshold", minval=5, maxval=50, step=5, group=grpCaution)
+caution_strong_thresh = input.float(50.0, "Strong Caution Threshold", minval=25, maxval=80, step=5, group=grpCaution)
+caution_critical_thresh = input.float(75.0, "Critical Caution Threshold", minval=50, maxval=100, step=5, group=grpCaution)
+
+w_caution_dir = input.float(30.0, "Direction State Weight %", minval=0, maxval=100, step=5, group=grpCaution)
+w_caution_wae = input.float(20.0, "WAE Momentum Weight %", minval=0, maxval=100, step=5, group=grpCaution)
+w_caution_ext = input.float(20.0, "Extension Weight %", minval=0, maxval=100, step=5, group=grpCaution)
+w_caution_ivr = input.float(15.0, "Volume Regime Weight %", minval=0, maxval=100, step=5, group=grpCaution)
+w_caution_ure = input.float(15.0, "URE Divergence Weight %", minval=0, maxval=100, step=5, group=grpCaution)
+
+ext_mad_len = input.int(14, "Extension MAD Length", minval=5, group=grpCaution)
+ext_mad_mult = input.float(2.0, "Extension MAD Multiplier", minval=0.5, maxval=5.0, step=0.1, group=grpCaution)
+ext_kernel_weight = input.float(0.5, "Kernel vs MAD Blend", minval=0.0, maxval=1.0, step=0.1, group=grpCaution)
+
+float total_caution_w = w_caution_dir + w_caution_wae + w_caution_ext + w_caution_ivr + w_caution_ure
+float cw_dir = total_caution_w > 0 ? w_caution_dir / total_caution_w : 0.20
+float cw_wae = total_caution_w > 0 ? w_caution_wae / total_caution_w : 0.20
+float cw_ext = total_caution_w > 0 ? w_caution_ext / total_caution_w : 0.20
+float cw_ivr = total_caution_w > 0 ? w_caution_ivr / total_caution_w : 0.20
+float cw_ure = total_caution_w > 0 ? w_caution_ure / total_caution_w : 0.20
+
+float caution_dir = dir_iTrend_early_bull ? 20.0 :
+  dir_iTrend_early_bear ? 70.0 :
+  dir_strong_up ? 0.0 :
+  dir_weak_up ? 30.0 :
+  dir_slowing_dn ? 60.0 : 100.0
+
+float wae_peak = ta.highest(trendUp, 10)
+float wae_fade_ratio = wae_peak > 0 ? trendUp / wae_peak : 1.0
+float caution_wae_fade = (1.0 - wae_fade_ratio) * 60.0
+float dz_headroom = DEAD_ZONE > 0 ? (math.max(trendUp, trendDown) - DEAD_ZONE) / DEAD_ZONE : 0.0
+float caution_wae_dz = dz_headroom < 0.5 ? (1.0 - dz_headroom * 2.0) * 40.0 : 0.0
+float wae_conflict = trendUp > 0 and trendDown > 0 ? 30.0 : 0.0
+float caution_wae = math.min(100.0, caution_wae_fade + caution_wae_dz + wae_conflict)
+
+float kernel_band_width = nz(kr_upper - kr_lower, 1.0)
+float kernel_extension = kernel_band_width > 0 ?
+  math.abs(close - kr_mean) / (kernel_band_width * 0.5) : 0.0
+float caution_kernel = math.min(100.0, math.max(0.0, (kernel_extension - 0.5) * 200.0))
+
+float ext_median = ta.median(close, ext_mad_len)
+float ext_mad_sum = 0.0
+for i = 0 to ext_mad_len - 1
+    ext_mad_sum += math.abs(close[i] - ext_median)
+float ext_mad_val = ext_mad_sum / ext_mad_len
+float mad_extension = ext_mad_val > 0 ?
+  math.abs(close - ext_median) / (ext_mad_val * ext_mad_mult) : 0.0
+float caution_mad = math.min(100.0, math.max(0.0, (mad_extension - 0.5) * 200.0))
+
+float caution_ext = caution_kernel * ext_kernel_weight + caution_mad * (1.0 - ext_kernel_weight)
+
+float caution_ivr_base = regime_is_markup ? 0.0 :
+  regime_is_accum ? 15.0 :
+  regime_is_compression ? 45.0 :
+  regime_is_neutral ? 55.0 :
+  regime_is_markdown ? 80.0 :
+  regime_is_liquidity ? 100.0 : 50.0
+
+float caution_ivr_transition = 0.0
+if ivr_markup_to_markdown
+    caution_ivr_transition := 30.0
+if ivr_accum_to_markup
+    caution_ivr_transition := -20.0
+if ivr_compression_to_accum
+    caution_ivr_transition := -10.0
+
+float caution_ivr_div = 0.0
+if ivr_bear_div
+    caution_ivr_div := 25.0
+if ivr_bull_div
+    caution_ivr_div := -15.0
+
+float caution_ivr = math.max(0.0, math.min(100.0, caution_ivr_base + caution_ivr_transition + caution_ivr_div))
+
+float caution_ure_base = ure_advanced_state == "EXHAUSTION" ? 70.0 :
+  ure_advanced_state == "NO_TRADE" ? 50.0 :
+  ure_advanced_state == "IGNITION" ? 20.0 :
+  ure_advanced_state == "TREND" ? 10.0 :
+  ure_advanced_state == "ELITE" ? 0.0 : 50.0
+
+float caution_ure_div_adj = 0.0
+if ure_bear_div
+    caution_ure_div_adj := 25.0
+if ure_bull_div
+    caution_ure_div_adj := -15.0
+
+float caution_ure_stress = ure_stress_score > ure_stress_high ? 20.0 :
+  ure_stress_score > ure_stress_medium ? 10.0 : 0.0
+
+float caution_ure = math.max(0.0, math.min(100.0, caution_ure_base + caution_ure_div_adj + caution_ure_stress))
+
+float caution_score = (caution_dir * cw_dir) + (caution_wae * cw_wae) + (caution_ext * cw_ext) + (caution_ivr * cw_ivr) + (caution_ure * cw_ure)
+caution_score := math.max(0.0, math.min(100.0, caution_score))
+
+//════════════════════════════════════════════════════════════════════════════════
+// UNIFIED SCALE
+//════════════════════════════════════════════════════════════════════════════════
+
+float dir_slope_absmax = ta.ema(math.max(math.abs(ta.highest(dir_slope_raw, 200)), math.abs(ta.lowest(dir_slope_raw, 200))), 50)
+dir_slope_absmax := math.max(dir_slope_absmax, 1e-10)
+float scaledSlope = dir_slope_raw / dir_slope_absmax * 100
+float vre_column_height = 100.0 * vre_height_pct
+
+//════════════════════════════════════════════════════════════════════════════════
+// LAYER 1 (BACK): BACKGROUND COLORS
+//════════════════════════════════════════════════════════════════════════════════
+
+showSlopeLine = input.bool(true, "Show Direction Slope Line", group="Direction Visuals")
+
+col_score_5 = input.color(color.new(color.white, 0), "Score 5/5 Background", group="Direction Visuals")
+col_score_4 = input.color(color.new(#00FF2E, 0), "Score 4/5 Background", group="Direction Visuals")
+col_score_3 = input.color(color.new(#EFFC06, 0), "Score 3/5 Background", group="Direction Visuals")
+
+col_exit_5 = input.color(color.new(#FF00D5, 0), "Exit 5/5 Background", group="Direction Visuals")
+col_exit_4 = input.color(color.new(#CC1FFB, 0), "Exit 4/5 Background", group="Direction Visuals")
+col_exit_3 = input.color(color.new(#00C3FF, 0), "Exit 3/5 Background", group="Direction Visuals")
+
+// Entry bgcolor: score-based (only fires when gated)
+bgcolor(sc_gated >= 5 ? col_score_5 : na, title="⭐ ENTRY 5/5")
+bgcolor(sc_gated == 4 ? col_score_4 : na, title="✅ ENTRY 4/5")
+bgcolor(sc_gated == 3 ? col_score_3 : na, title="📊 ENTRY 3/5")
+
+// Exit bgcolor: score-based (only fires when gated)
+bgcolor(sx_gated >= 5 ? col_exit_5 : na, title="🚨 EXIT 5/5")
+bgcolor(sx_gated == 4 ? col_exit_4 : na, title="🔴 EXIT 4/5")
+bgcolor(sx_gated == 3 ? col_exit_3 : na, title="⚠️ EXIT 3/5")
+
+//════════════════════════════════════════════════════════════════════════════════
+// LAYER 2: VRE REGIME COLUMNS (no neutral — saves 1 plot)
+//════════════════════════════════════════════════════════════════════════════════
+
+plot(showVolRegime and vre_trendIgnition ? vre_column_height : na,
+  title="🚀 VRE Trend Ignition", style=plot.style_columns, linewidth=2, color=vre_col_ignition)
+//plot(showVolRegime and vre_fakeBreakout ? vre_column_height : na,
+  //title="⚠️ VRE Fake Breakout", style=plot.style_columns, linewidth=2, color=vre_col_fake)
+plot(showVolRegime and vre_meanReversion ? vre_column_height : na,
+  title="🔄 VRE Mean Reversion", style=plot.style_columns, linewidth=2, color=vre_col_reversion)
+plot(showVolRegime and vre_volatilityChurn ? vre_column_height : na,
+  title="🌪️ VRE Vol Churn", style=plot.style_columns, linewidth=2, color=vre_col_churn)
+
+//════════════════════════════════════════════════════════════════════════════════
+// LAYER 3: URE FILL + DIRECTION SLOPE (unified bullish fill)
+//════════════════════════════════════════════════════════════════════════════════
+
+p_zero = plot(0, "Zero (Fill Ref)", display=display.none)
+
+float ure_fill_val = showUREFill and showDirection ? scaledSlope : na
+p_ure_fill = plot(ure_fill_val, "URE Fill Edge", style=plot.style_area, color=color.new(color.black, 100), display=display.all, editable=false)
+
+fill(p_ure_fill, p_zero, color=showUREFill ? ure_fill_color : na, title="URE State Fill")
+
+//hline(0, "Zero Line", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+
+plot(showDirection and showSlopeLine ? scaledSlope : na,
+  "Direction Slope (JMA/iTrend)", color=dir_state_color, linewidth=2)
+
+//════════════════════════════════════════════════════════════════════════════════
+// LAYER 4 (FRONT): TRAILING STOP BUY/SELL SIGNALS (confluence-filtered)
+//════════════════════════════════════════════════════════════════════════════════
+
+plotshape(showTrailSignals and ts_buySignal, title="Trail Buy Signal",
+  style=shape.triangleup, location=location.bottom,
+  color=ts_col_buy, size=size.small, text="BUY", textcolor=ts_col_buy)
+
+plotshape(showTrailSignals and ts_sellSignal, title="Trail Sell Signal",
+  style=shape.triangledown, location=location.top,
+  color=ts_col_sell, size=size.small, text="SELL", textcolor=ts_col_sell)
+
+//════════════════════════════════════════════════════════════════════════════════
+// IVR MARKERS
+//════════════════════════════════════════════════════════════════════════════════
+
+//plotshape(ivr_accum_to_markup, title="IVR GO",
+  //style=shape.circle, location=location.bottom,
+  //color=color.new(color.lime, 20), size=size.tiny,
+  //text="GO", textcolor=color.white)
+
+//plotshape(ivr_compression_to_accum, title="IVR BUILD",
+  //style=shape.diamond, location=location.bottom,
+  //color=color.new(color.yellow, 20), size=size.tiny,
+  //text="BUILD", textcolor=color.black)
+
+//════════════════════════════════════════════════════════════════════════════════
+// ALERTS
+//════════════════════════════════════════════════════════════════════════════════
+
+alertcondition(sc_gated >= 5, title="⭐ Entry Score 5/5",
+  message="ENTRY 5/5: All five components aligned — WAE + IVR + VRE + JMA + URE")
+alertcondition(sc_gated == 4, title="✅ Entry Score 4/5",
+  message="ENTRY 4/5: Four of five components aligned")
+alertcondition(sc_gated == 3, title="📊 Entry Score 3/5",
+  message="ENTRY 3/5: Three of five components aligned")
+
+alertcondition(sx_gated >= 5, title="🚨 Exit Score 5/5",
+  message="EXIT 5/5: All five exit components aligned")
+alertcondition(sx_gated == 4, title="🔴 Exit Score 4/5",
+  message="EXIT 4/5: Four of five exit components aligned")
+alertcondition(sx_gated == 3, title="⚠️ Exit Score 3/5",
+  message="EXIT 3/5: Three of five exit components aligned")
+
+alertcondition(ivr_accum_to_markup, title="IVR: Accum → Markup", message="IVR: GO")
+alertcondition(ivr_compression_to_accum, title="IVR: Compress → Accum", message="IVR: BUILD")
+alertcondition(ivr_markup_to_markdown, title="IVR: Markup → Markdown", message="IVR: Distribution")
+
+alertcondition(vre_trendIgnition, title="🚀 VRE Trend Ignition", message="Volatility Regime: Trend Ignition")
+alertcondition(vre_fakeBreakout, title="⚠️ VRE Fake Breakout", message="Volatility Regime: Fake Breakout")
+
+alertcondition(ure_advanced_state == "ELITE" and ure_advanced_state[1] != "ELITE", title="URE ELITE", message="URE: Advanced engine → ELITE")
+alertcondition(ure_advanced_state == "EXHAUSTION" and ure_advanced_state[1] != "EXHAUSTION", title="URE EXHAUSTION", message="URE: Advanced engine → EXHAUSTION")
+alertcondition(ure_bear_div, title="URE Bearish Divergence", message="URE: Bearish divergence detected")
+alertcondition(ure_bull_div, title="URE Bullish Divergence", message="URE: Bullish divergence detected")
+
+alertcondition(ts_buySignal, title="🔺 Trail Stop Buy", message="Trail Stop: Bullish flip")
+alertcondition(ts_sellSignal, title="🔻 Trail Stop Sell", message="Trail Stop: Bearish flip")
+
+//════════════════════════════════════════════════════════════════════════════════
+// HIDDEN OUTPUTS (consolidated)
+//════════════════════════════════════════════════════════════════════════════════
+
+plot(dir_trade_state * 10000 + ivr_regime_state * 100 + vre_regime_state, "Dir|IVR|VRE Packed", display=display.none)
+
+plot(sc_gated * 10 + sx_gated, "Entry|Exit Score Packed", display=display.none)
+
+// Component flags packed: WAE=10000, IVR=1000, VRE=100, JMA=10, URE=1
+float _entry_flags = (sc_wae ? 10000 : 0) + (sc_ivr ? 1000 : 0) + (sc_vre ? 100 : 0) + (sc_jma ? 10 : 0) + (sc_ure ? 1 : 0)
+float _exit_flags = (sx_wae ? 10000 : 0) + (sx_ivr ? 1000 : 0) + (sx_vre ? 100 : 0) + (sx_jma ? 10 : 0) + (sx_ure ? 1 : 0)
+plot(_entry_flags, "Entry Component Flags", display=display.none)
+plot(_exit_flags, "Exit Component Flags", display=display.none)
+
+plot(caution_score, "Caution Score", display=display.none)
+plot(ure_kalman_state, "URE Kalman State", display=display.none)
+
+float _ure_state_code = ure_advanced_state == "ELITE" ? 4 : ure_advanced_state == "TREND" ? 3 : ure_advanced_state == "IGNITION" ? 2 : ure_advanced_state == "EXHAUSTION" ? 1 : 0
+plot(math.round(ure_advanced_confidence * 1000) + math.round(ure_stress_score * 100) + _ure_state_code, "URE Conf|Stress|State Packed", display=display.none)
+
+plot(math.round(ure_independent_er * 1000) + math.round(ure_atr_ratio * 100), "URE ER|ATR Packed", display=display.none)
+
+float _ure_div = ure_bear_div ? 1 : ure_bull_div ? -1 : 0
+plot(math.round(ure_composite_raw * 100) + _ure_div, "URE Composite|Div Packed", display=display.none)
+
+plot(dir_adaptive_len, "Direction JMA Length", display=display.none)
+
+plot(ts_trend, "Trail Trend State", display=display.none)
+plot(ts_trailStop, "Trail Stop Price", display=display.none)
+plot(ts_adaptiveJmaLen * 100 + ts_adaptiveVolLen + ts_adaptiveAdxLen * 0.01, "Trail JMA|MAD|ADX Packed", display=display.none)
+plot(ts_buyRaw ? 1 : 0, "Trail Buy Raw", display=display.none)

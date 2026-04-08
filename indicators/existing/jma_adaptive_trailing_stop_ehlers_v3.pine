@@ -1,0 +1,541 @@
+//@version=5
+indicator("JMA Adaptive Trailing Stop — Ehlers Cycle Edition v3.0", overlay=true, max_bars_back=500)
+
+// ═══════════════════════════════════════════════════════════════════════
+// INPUT PARAMETERS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Ehlers Dominant Cycle Settings
+useAdaptiveLen = input.bool(true, "Enable Adaptive Lengths (Ehlers Cycle)", group="Ehlers Dominant Cycle",
+  tooltip="When enabled, JMA, MAD, and ADX/ER lengths all adapt to the dominant cycle")
+staticJmaLen = input.int(16, "Static JMA Length (when adaptive off)", minval=1, group="Ehlers Dominant Cycle")
+staticVolLen = input.int(6, "Static MAD Length (when adaptive off)", minval=1, group="Ehlers Dominant Cycle")
+staticAdxLen = input.int(6, "Static ADX/ER Length (when adaptive off)", minval=1, group="Ehlers Dominant Cycle")
+minPeriod = input.int(8, "Min Cycle Period", minval=4, group="Ehlers Dominant Cycle",
+  tooltip="Floor for detected cycle — prevents all lengths from becoming too twitchy")
+maxPeriod = input.int(48, "Max Cycle Period", minval=10, group="Ehlers Dominant Cycle",
+  tooltip="Ceiling for detected cycle — prevents all lengths from becoming too sluggish")
+cycleMethod = input.string("Autocorrelation", "Cycle Detection Method",
+  options=["Autocorrelation", "Hilbert"], group="Ehlers Dominant Cycle",
+  tooltip="Autocorrelation is more robust but heavier. Hilbert is lighter for low TFs.")
+
+// Cycle Multipliers — each component gets its own fraction of the cycle
+grpCycleMult = "Cycle Multipliers"
+jmaCycleMultiplier = input.float(0.5, "JMA Price Cycle Mult", minval=0.1, maxval=2.0, step=0.05, group=grpCycleMult,
+  tooltip="JMA length = smoothedCycle × this. 0.5 = half cycle (Ehlers recommended)")
+volCycleMultiplier = input.float(0.5, "MAD Volatility Cycle Mult", minval=0.1, maxval=2.0, step=0.05, group=grpCycleMult,
+  tooltip="MAD length = smoothedCycle × this. 0.5 = capture one volatility swing per half cycle")
+adxCycleMultiplier = input.float(0.5, "ADX/ER Cycle Mult", minval=0.1, maxval=2.0, step=0.05, group=grpCycleMult,
+  tooltip="ADX/ER length = smoothedCycle × this. 0.5–0.75 recommended for trend strength")
+minAdaptiveLen = input.int(3, "Min Adaptive Length (all)", minval=2, maxval=10, group=grpCycleMult,
+  tooltip="Floor for any adaptive length — prevents divisions by near-zero windows")
+
+// Cycle Smoothing
+cycleSmoothMethod = input.string("JMA", "Cycle Smoothing Method",
+  options=["JMA", "EMA", "SuperSmoother", "None"], group="Cycle Smoothing",
+  tooltip="JMA recommended — low lag on regime shifts, high smoothing on noise")
+cycleSmoothLen = input.int(8, "Cycle Smooth Length", minval=2, group="Cycle Smoothing")
+cycleJmaPhase = input.float(50, "Cycle JMA Phase", minval=-100, maxval=100, group="Cycle Smoothing")
+cycleJmaPower = input.float(2.0, "Cycle JMA Power", minval=1, maxval=10, step=0.1, group="Cycle Smoothing")
+
+// JMA Settings (Price)
+jmaPhase = input.float(100, "JMA Phase", minval=-100, maxval=100, group="JMA Settings")
+jmaPower = input.float(3.5, "JMA Power", minval=1, step=0.1, group="JMA Settings")
+
+// iTrend / State Machine Settings
+itrend_alpha = input.float(0.09, "iTrend Alpha", step=0.01, group="JMA/iTrend State Machine")
+accel_len = input.int(2, "Acceleration Smooth", minval=1, group="JMA/iTrend State Machine")
+slope_len = input.int(2, "Slope Lookback", minval=1, group="JMA/iTrend State Machine")
+
+// State Machine Colors
+col_strong_up = input.color(color.new(color.lime, 0), "Strong Up", group="JMA/iTrend State Machine")
+col_weak_up = input.color(color.new(color.yellow, 0), "Weak Up", group="JMA/iTrend State Machine")
+col_slowing_dn = input.color(color.new(color.aqua, 0), "Slowing Dn", group="JMA/iTrend State Machine")
+col_down = input.color(color.new(color.red, 0), "Down", group="JMA/iTrend State Machine")
+
+// State Adaptive Blending
+state_weight = input.float(0.5, "State Machine Weight", minval=0.0, maxval=1.0, step=0.05, group="State Adaptive Blending")
+strong_up_factor = input.float(1.0, "Strong Up → Tightness", minval=0.0, maxval=1.0, step=0.05, group="State Adaptive Blending")
+weak_up_factor = input.float(0.7, "Weak Up → Tightness", minval=0.0, maxval=1.0, step=0.05, group="State Adaptive Blending")
+slowing_dn_factor = input.float(0.4, "Slowing Dn → Tightness", minval=0.0, maxval=1.0, step=0.05, group="State Adaptive Blending")
+down_factor = input.float(0.15, "Down → Tightness", minval=0.0, maxval=1.0, step=0.05, group="State Adaptive Blending")
+itrend_early_factor = input.float(0.35, "iTrend Early → Tightness", minval=0.0, maxval=1.0, step=0.05, group="State Adaptive Blending")
+
+// Volatility Settings
+baseMultiplier = input.float(0.7, "Base Multiplier", minval=0.1, step=0.1, group="Volatility Settings")
+
+// Adaptive Settings (ADX+ER)
+adxWeight = input.float(0.4, "ADX Weight", minval=0.0, maxval=1.0, step=0.1, group="Adaptive Settings")
+adaptiveSensitivity = input.float(1.0, "Sensitivity", minval=0.1, maxval=5.0, step=0.1, group="Adaptive Settings")
+minMultiplier = input.float(0.3, "Min Multiplier", minval=0.1, step=0.1, group="Adaptive Settings")
+maxMultiplier = input.float(7.0, "Max Multiplier", minval=0.1, step=0.1, group="Adaptive Settings")
+
+// Advanced
+smoothAdaptive = input.bool(true, "Smooth Adaptive Signal", group="Advanced")
+smoothLength = input.int(3, "Smoothing Length", minval=1, group="Advanced")
+
+// Dashboard
+showCycleDash = input.bool(true, "Show Cycle Dashboard", group="Display")
+
+// ═══════════════════════════════════════════════════════════════════════
+// EHLERS AUTOCORRELATION PERIODOGRAM
+// ═══════════════════════════════════════════════════════════════════════
+
+ehlers_autocorrelation(src, minP, maxP) =>
+    float hp = na
+    float a1_hp = math.exp(-math.sqrt(2.0) * math.pi / maxP)
+    float b1_hp = 2.0 * a1_hp * math.cos(math.sqrt(2.0) * math.pi / maxP)
+    float hp_c2 = b1_hp
+    float hp_c3 = -(a1_hp * a1_hp)
+    float hp_c1 = (1.0 + hp_c2 - hp_c3) / 4.0
+    hp := bar_index < 3 ? 0.0 :
+      hp_c1 * (src - 2.0 * nz(src[1]) + nz(src[2])) + hp_c2 * nz(hp[1]) + hp_c3 * nz(hp[2])
+
+    float filt = na
+    float a1_ss = math.exp(-math.sqrt(2.0) * math.pi / (0.5 * maxP))
+    float b1_ss = 2.0 * a1_ss * math.cos(math.sqrt(2.0) * math.pi / (0.5 * maxP))
+    float ss_c2 = b1_ss
+    float ss_c3 = -(a1_ss * a1_ss)
+    float ss_c1 = 1.0 - ss_c2 - ss_c3
+    filt := bar_index < 3 ? 0.0 :
+      ss_c1 * (hp + nz(hp[1])) * 0.5 + ss_c2 * nz(filt[1]) + ss_c3 * nz(filt[2])
+
+    float maxPower = 0.0
+    float dominantPeriod = 0.0
+    int avgLen = maxP
+
+    for period = minP to maxP
+        float cosinePart = 0.0
+        float sinePart = 0.0
+        for n = 0 to avgLen - 1
+            angle = 2.0 * math.pi * n / period
+            cosinePart += nz(filt[n]) * math.cos(angle)
+            sinePart += nz(filt[n]) * math.sin(angle)
+        float power = cosinePart * cosinePart + sinePart * sinePart
+        if power > maxPower
+            maxPower := power
+            dominantPeriod := period
+
+    dominantPeriod
+
+// ═══════════════════════════════════════════════════════════════════════
+// EHLERS HILBERT TRANSFORM (LIGHTER ALTERNATIVE)
+// ═══════════════════════════════════════════════════════════════════════
+
+ehlers_hilbert(src, minP, maxP) =>
+    var float smooth_val = na
+    smooth_val := (4.0 * src + 3.0 * nz(src[1]) + 2.0 * nz(src[2]) + nz(src[3])) / 10.0
+
+    var float detrender = na
+    detrender := (0.0962 * smooth_val + 0.5769 * nz(smooth_val[2]) -
+      0.5769 * nz(smooth_val[4]) - 0.0962 * nz(smooth_val[6])) *
+      (0.075 * nz(smooth_val[1]) + 0.54)
+
+    var float I1 = na
+    var float Q1 = na
+    I1 := nz(detrender[3])
+    Q1 := (0.0962 * detrender + 0.5769 * nz(detrender[2]) -
+      0.5769 * nz(detrender[4]) - 0.0962 * nz(detrender[6])) *
+      (0.075 * nz(detrender[1]) + 0.54)
+
+    var float I2 = na
+    var float Q2 = na
+    I2 := I1 - 0.25 * Q1
+    Q2 := 0.25 * I1 + Q1
+    I2 := 0.2 * I2 + 0.8 * nz(I2[1])
+    Q2 := 0.2 * Q2 + 0.8 * nz(Q2[1])
+
+    var float period_raw = na
+    if I2 != 0 and Q2 != 0
+        period_raw := 2.0 * math.pi / math.atan(Q2 / I2)
+
+    float clamped = math.max(minP, math.min(maxP, nz(period_raw, (minP + maxP) / 2)))
+    var float smoothed_period = na
+    smoothed_period := 0.2 * clamped + 0.8 * nz(smoothed_period[1], clamped)
+    smoothed_period
+
+// ═══════════════════════════════════════════════════════════════════════
+// CYCLE SMOOTHING — JMA (proper 3-stage feedback)
+// ═══════════════════════════════════════════════════════════════════════
+
+jma_cycle_smooth(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float c_e0 = na
+    var float c_e1 = na
+    var float c_e2 = na
+    var float c_jv = na
+    c_e0 := (1 - alpha) * src + alpha * nz(c_e0[1], src)
+    c_e1 := (src - c_e0) * (1 - beta) + beta * nz(c_e1[1], 0)
+    c_e2 := (c_e0 + phaseRatio * c_e1 - nz(c_jv[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(c_e2[1], 0)
+    c_jv := c_e2 + nz(c_jv[1], src)
+    c_jv
+
+// Ehlers SuperSmoother (2-pole) for cycle data
+supersmoother_cycle(src, length) =>
+    a1 = math.exp(-math.sqrt(2.0) * math.pi / length)
+    b1 = 2.0 * a1 * math.cos(math.sqrt(2.0) * math.pi / length)
+    c2 = b1
+    c3 = -(a1 * a1)
+    c1 = 1.0 - c2 - c3
+    var float ss = na
+    ss := na(ss[1]) or na(ss[2]) ? src :
+      c1 * (src + nz(src[1])) * 0.5 + c2 * nz(ss[1]) + c3 * nz(ss[2])
+    ss
+
+// ═══════════════════════════════════════════════════════════════════════
+// DOMINANT CYCLE → SMOOTHED CYCLE → THREE ADAPTIVE LENGTHS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Step 1: Detect raw dominant cycle
+float rawCycle = na
+if useAdaptiveLen
+    rawCycle := cycleMethod == "Autocorrelation" ?
+      ehlers_autocorrelation(close, minPeriod, maxPeriod) :
+      ehlers_hilbert(close, minPeriod, maxPeriod)
+
+// Step 2: Smooth the cycle
+float smoothedCycle = na
+if not useAdaptiveLen
+    smoothedCycle := float(staticJmaLen)
+else if cycleSmoothMethod == "JMA"
+    smoothedCycle := jma_cycle_smooth(rawCycle, cycleSmoothLen, cycleJmaPhase, cycleJmaPower)
+else if cycleSmoothMethod == "EMA"
+    smoothedCycle := ta.ema(rawCycle, cycleSmoothLen)
+else if cycleSmoothMethod == "SuperSmoother"
+    smoothedCycle := supersmoother_cycle(rawCycle, cycleSmoothLen)
+else
+    smoothedCycle := rawCycle
+
+// Step 3: Derive three adaptive lengths from one smoothed cycle
+//
+//         smoothedCycle
+//          ╱    │    ╲
+//    ×jmaMult ×volMult ×adxMult
+//         │     │      │
+//    JMA Len  MAD Len  ADX/ER Len
+
+float adaptiveJmaLen = na
+float adaptiveVolLen = na
+float adaptiveAdxLen = na
+
+if useAdaptiveLen
+    // JMA Price — the anchor
+    float jmaTarget = smoothedCycle * jmaCycleMultiplier
+    adaptiveJmaLen := math.round(math.max(minAdaptiveLen, math.min(maxPeriod, jmaTarget)))
+
+    // MAD Volatility — captures one swing per fraction of cycle
+    float volTarget = smoothedCycle * volCycleMultiplier
+    adaptiveVolLen := math.round(math.max(minAdaptiveLen, math.min(maxPeriod, volTarget)))
+
+    // ADX/ER — trend strength window
+    float adxTarget = smoothedCycle * adxCycleMultiplier
+    adaptiveAdxLen := math.round(math.max(minAdaptiveLen, math.min(maxPeriod, adxTarget)))
+else
+    adaptiveJmaLen := float(staticJmaLen)
+    adaptiveVolLen := float(staticVolLen)
+    adaptiveAdxLen := float(staticAdxLen)
+
+// Ensure integer versions for functions that need int
+int intVolLen = int(adaptiveVolLen)
+int intAdxLen = int(adaptiveAdxLen)
+
+// ═══════════════════════════════════════════════════════════════════════
+// JMA CALCULATION — PRICE (proper 3-stage feedback)
+// ═══════════════════════════════════════════════════════════════════════
+
+jma_price(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float p_e0 = na
+    var float p_e1 = na
+    var float p_e2 = na
+    var float p_jv = na
+    p_e0 := (1 - alpha) * src + alpha * nz(p_e0[1], src)
+    p_e1 := (src - p_e0) * (1 - beta) + beta * nz(p_e1[1], 0)
+    p_e2 := (p_e0 + phaseRatio * p_e1 - nz(p_jv[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(p_e2[1], 0)
+    p_jv := p_e2 + nz(p_jv[1], src)
+    p_jv
+
+jmaLine = jma_price(close, adaptiveJmaLen, jmaPhase, jmaPower)
+
+// ═══════════════════════════════════════════════════════════════════════
+// iTREND CALCULATION
+// ═══════════════════════════════════════════════════════════════════════
+
+iTrend_func(src, alpha) =>
+    var float it = na
+    it := (alpha - (alpha * alpha) / 4) * src +
+      0.5 * alpha * alpha * nz(src[1]) -
+      (alpha - 0.75 * alpha * alpha) * nz(src[2]) +
+      2 * (1 - alpha) * nz(it[1]) -
+      (1 - alpha) * (1 - alpha) * nz(it[2])
+    it
+
+iTrend = iTrend_func(close, itrend_alpha)
+iTrend_cross = ta.cross(iTrend, 0)
+
+// ═══════════════════════════════════════════════════════════════════════
+// JMA/iTREND STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════
+
+jma_slope_raw = jmaLine - jmaLine[slope_len]
+jma_accel_raw = jma_slope_raw - jma_slope_raw[1]
+jma_accel = ta.ema(jma_accel_raw, accel_len)
+
+slope_pos = jma_slope_raw > 0
+slope_neg = jma_slope_raw < 0
+accel_pos = jma_accel > 0
+accel_neg = jma_accel < 0
+
+jma_green = slope_pos and accel_pos
+jma_yellow = slope_pos and accel_neg
+jma_blue = slope_neg and accel_pos
+jma_red = slope_neg and accel_neg
+
+jma_weakening = jma_accel < 0 or math.abs(jma_slope_raw) < math.abs(jma_slope_raw[1])
+iTrend_early_signal = iTrend_cross and jma_weakening
+
+jma_color = iTrend_early_signal ? (iTrend > 0 ? col_weak_up : col_slowing_dn) :
+  jma_green ? col_strong_up :
+  jma_yellow ? col_weak_up :
+  jma_blue ? col_slowing_dn :
+  col_down
+
+// ═══════════════════════════════════════════════════════════════════════
+// STATE MACHINE → ADAPTIVE TIGHTNESS FACTOR
+// ═══════════════════════════════════════════════════════════════════════
+
+stateFactor = iTrend_early_signal ? itrend_early_factor :
+  jma_green ? strong_up_factor :
+  jma_yellow ? weak_up_factor :
+  jma_blue ? slowing_dn_factor :
+  down_factor
+
+// ═══════════════════════════════════════════════════════════════════════
+// MAD VOLATILITY — NOW CYCLE-ADAPTIVE
+// ═══════════════════════════════════════════════════════════════════════
+
+getMAD(length) =>
+    median = ta.median(close, length)
+    sum = 0.0
+    for i = 0 to length - 1
+        sum += math.abs(close[i] - median)
+    sum / length
+
+volatility = getMAD(intVolLen)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ADX + ER — NOW CYCLE-ADAPTIVE (series-compatible manual calculations)
+// ═══════════════════════════════════════════════════════════════════════
+
+calcER(length) =>
+    change = math.abs(close - close[length])
+    volatilitySum = 0.0
+    for i = 0 to length - 1
+        volatilitySum += math.abs(close[i] - close[i + 1])
+    er = volatilitySum != 0 ? change / volatilitySum : 0
+    math.min(er, 1.0)
+
+// Manual RMA that accepts series int length
+// RMA formula: rma = alpha * src + (1 - alpha) * rma[1], where alpha = 1/length
+series_rma(src, length) =>
+    float alpha = 1.0 / math.max(length, 1)
+    var float rma_val = na
+    rma_val := na(rma_val[1]) ? src : alpha * src + (1.0 - alpha) * nz(rma_val[1])
+    rma_val
+
+// TR, +DM, -DM raw values (these don't need length)
+float tr_raw = math.max(high - low, math.max(math.abs(high - nz(close[1])), math.abs(low - nz(close[1]))))
+float plus_dm_raw = high - nz(high[1]) > nz(low[1]) - low and high - nz(high[1]) > 0 ? high - nz(high[1]) : 0.0
+float minus_dm_raw = nz(low[1]) - low > high - nz(high[1]) and nz(low[1]) - low > 0 ? nz(low[1]) - low : 0.0
+
+// Smooth with adaptive-length RMA
+float adx_smooth_tr = series_rma(tr_raw, intAdxLen)
+float adx_smooth_plus = series_rma(plus_dm_raw, intAdxLen)
+float adx_smooth_minus = series_rma(minus_dm_raw, intAdxLen)
+
+// DI+ and DI-
+float di_plus = adx_smooth_tr != 0 ? adx_smooth_plus / adx_smooth_tr * 100 : 0.0
+float di_minus = adx_smooth_tr != 0 ? adx_smooth_minus / adx_smooth_tr * 100 : 0.0
+
+// DX → ADX
+float dx_val = (di_plus + di_minus) != 0 ? math.abs(di_plus - di_minus) / (di_plus + di_minus) * 100 : 0.0
+float adx_final = series_rma(dx_val, intAdxLen)
+
+erValue = calcER(intAdxLen)
+adxValue = math.min(adx_final / 100, 1.0)
+
+adaptiveRaw = adxValue * adxWeight + erValue * (1 - adxWeight)
+adaptiveSmoothed = smoothAdaptive ? ta.ema(adaptiveRaw, smoothLength) : adaptiveRaw
+adaptiveNorm = math.min(adaptiveSmoothed * adaptiveSensitivity, 1.0)
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLENDED ADAPTIVE SIGNAL (ADX+ER + STATE MACHINE)
+// ═══════════════════════════════════════════════════════════════════════
+
+blendedAdaptive = adaptiveNorm * (1.0 - state_weight) + stateFactor * state_weight
+
+adaptiveMultiplier = maxMultiplier - (maxMultiplier - minMultiplier) * blendedAdaptive
+finalMultiplier = baseMultiplier * adaptiveMultiplier
+
+// ═══════════════════════════════════════════════════════════════════════
+// TRAILING STOP LOGIC
+// ═══════════════════════════════════════════════════════════════════════
+
+longStop = jmaLine - volatility * finalMultiplier
+shortStop = jmaLine + volatility * finalMultiplier
+
+var float trailStop = na
+var int trend = 0
+
+if na(trailStop[1])
+    trailStop := longStop
+    trend := 1
+else
+    if close > trailStop[1] and close[1] > trailStop[1]
+        trend := 1
+        trailStop := math.max(longStop, trailStop[1])
+    else if close < trailStop[1] and close[1] < trailStop[1]
+        trend := -1
+        trailStop := math.min(shortStop, trailStop[1])
+    else if close > trailStop[1]
+        trend := 1
+        trailStop := longStop
+    else
+        trend := -1
+        trailStop := shortStop
+
+// ═══════════════════════════════════════════════════════════════════════
+// PLOTTING
+// ═══════════════════════════════════════════════════════════════════════
+
+longColor = color.new(color.green, 0)
+shortColor = color.new(color.red, 0)
+
+plot(jmaLine, "JMA/iTrend", color=jma_color, linewidth=2)
+plot(trailStop, "Trailing Stop", color=trend == 1 ? longColor : shortColor, linewidth=2)
+
+plotshape(trend != trend[1] and trend == 1, "Buy Signal",
+  shape.triangleup, location.belowbar, longColor, size=size.small)
+plotshape(trend != trend[1] and trend == -1, "Sell Signal",
+  shape.triangledown, location.abovebar, shortColor, size=size.small)
+
+fill(plot(jmaLine, display=display.none), plot(trailStop, display=display.none),
+  color=trend == 1 ? color.new(color.green, 90) : color.new(color.red, 90))
+
+// ═══════════════════════════════════════════════════════════════════════
+// CYCLE DASHBOARD — HELPER FUNCTIONS (must be outside if block)
+// ═══════════════════════════════════════════════════════════════════════
+
+float cycleRange = maxPeriod - minPeriod
+
+speed_label(len) =>
+    float pos = cycleRange > 0 ? (len - minPeriod) / cycleRange : 0.5
+    pos < 0.33 ? "FAST" : pos < 0.66 ? "MED" : "SLOW"
+
+speed_color(len) =>
+    float pos = cycleRange > 0 ? (len - minPeriod) / cycleRange : 0.5
+    pos < 0.33 ? color.green : pos < 0.66 ? color.yellow : color.red
+
+// ═══════════════════════════════════════════════════════════════════════
+// CYCLE DASHBOARD — EXPANDED FOR 3 ADAPTIVE LENGTHS
+// ═══════════════════════════════════════════════════════════════════════
+
+if showCycleDash and barstate.islast
+    var table cyc_table = table.new(position.bottom_right, 3, 7,
+      border_width=1,
+      border_color=color.new(color.gray, 50),
+      frame_width=1,
+      frame_color=color.new(color.gray, 70))
+
+    table.cell(cyc_table, 0, 0, "CYCLE", text_color=color.white,
+      bgcolor=color.new(color.gray, 30), text_size=size.normal)
+    table.cell(cyc_table, 1, 0, "ENGINE", text_color=color.white,
+      bgcolor=color.new(color.gray, 30), text_size=size.normal)
+    table.cell(cyc_table, 2, 0, "v3.0", text_color=color.white,
+      bgcolor=color.new(color.gray, 30), text_size=size.small)
+
+    table.cell(cyc_table, 0, 1, "Raw", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(cyc_table, 1, 1,
+      useAdaptiveLen ? str.tostring(rawCycle, "#.#") : "OFF",
+      text_color=color.white,
+      bgcolor=color.new(color.blue, 40), text_size=size.normal)
+    table.cell(cyc_table, 2, 1, "", bgcolor=color.new(color.gray, 70))
+
+    table.cell(cyc_table, 0, 2, "Smoothed", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(cyc_table, 1, 2,
+      useAdaptiveLen ? str.tostring(smoothedCycle, "#.#") : "—",
+      text_color=color.white,
+      bgcolor=color.new(color.teal, 40), text_size=size.normal)
+    table.cell(cyc_table, 2, 2, "", bgcolor=color.new(color.gray, 70))
+
+    table.cell(cyc_table, 0, 3, "JMA Len", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(cyc_table, 1, 3,
+      str.tostring(adaptiveJmaLen, "#"),
+      text_color=color.white, bgcolor=speed_color(adaptiveJmaLen), text_size=size.normal)
+    table.cell(cyc_table, 2, 3,
+      speed_label(adaptiveJmaLen) + " ×" + str.tostring(jmaCycleMultiplier, "#.##"),
+      text_color=color.white, bgcolor=speed_color(adaptiveJmaLen), text_size=size.tiny)
+
+    table.cell(cyc_table, 0, 4, "MAD Len", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(cyc_table, 1, 4,
+      str.tostring(adaptiveVolLen, "#"),
+      text_color=color.white, bgcolor=speed_color(adaptiveVolLen), text_size=size.normal)
+    table.cell(cyc_table, 2, 4,
+      speed_label(adaptiveVolLen) + " ×" + str.tostring(volCycleMultiplier, "#.##"),
+      text_color=color.white, bgcolor=speed_color(adaptiveVolLen), text_size=size.tiny)
+
+    table.cell(cyc_table, 0, 5, "ADX Len", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(cyc_table, 1, 5,
+      str.tostring(adaptiveAdxLen, "#"),
+      text_color=color.white, bgcolor=speed_color(adaptiveAdxLen), text_size=size.normal)
+    table.cell(cyc_table, 2, 5,
+      speed_label(adaptiveAdxLen) + " ×" + str.tostring(adxCycleMultiplier, "#.##"),
+      text_color=color.white, bgcolor=speed_color(adaptiveAdxLen), text_size=size.tiny)
+
+    string methodLabel = useAdaptiveLen ?
+      cycleMethod + " → " + cycleSmoothMethod : "Static (all)"
+    table.cell(cyc_table, 0, 6, "Method", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(cyc_table, 1, 6, methodLabel,
+      text_color=color.white,
+      bgcolor=color.new(color.purple, 40), text_size=size.small)
+    table.cell(cyc_table, 2, 6,
+      useAdaptiveLen ? "ADAPTIVE" : "STATIC",
+      text_color=color.white,
+      bgcolor=useAdaptiveLen ? color.new(color.green, 40) : color.new(color.red, 40),
+      text_size=size.tiny)
+// ═══════════════════════════════════════════════════════════════════════
+// DIAGNOSTIC HIDDEN PLOTS (Data Window)
+// ═══════════════════════════════════════════════════════════════════════
+
+plot(useAdaptiveLen ? rawCycle : na, "Raw Dominant Cycle", display=display.none)
+plot(useAdaptiveLen ? smoothedCycle : na, "Smoothed Cycle", display=display.none)
+plot(adaptiveJmaLen, "Active JMA Length", display=display.none)
+plot(adaptiveVolLen, "Active MAD Length", display=display.none)
+plot(adaptiveAdxLen, "Active ADX/ER Length", display=display.none)
+plot(erValue, "ER", display=display.none)
+plot(adxValue, "ADX Norm", display=display.none)
+plot(adaptiveNorm, "ADX+ER Signal", display=display.none)
+plot(stateFactor, "State Factor", display=display.none)
+plot(blendedAdaptive, "Blended Adaptive", display=display.none)
+plot(finalMultiplier, "Final Multiplier", display=display.none)
+plot(volatility, "MAD Volatility", display=display.none)
+plot(iTrend, "iTrend Value", display=display.none)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════
+
+alertcondition(trend != trend[1] and trend == 1, "Buy Alert", "Bullish Signal")
+alertcondition(trend != trend[1] and trend == -1, "Sell Alert", "Bearish Signal")
+alertcondition(iTrend_early_signal and iTrend > 0, "iTrend Early Bullish", "iTrend bullish inflection")
+alertcondition(iTrend_early_signal and iTrend < 0, "iTrend Early Bearish", "iTrend bearish inflection")
