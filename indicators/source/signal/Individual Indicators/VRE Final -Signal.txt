@@ -1,0 +1,218 @@
+//@version=5
+indicator("Next-Gen Volatility Regime Engine [MTF] [MAD + Pressure + Efficiency]", overlay=false)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+src              = input.source(close, "Source")
+
+// MTF Settings
+enableHTF        = input.bool(true, "Enable Higher Timeframe", group="Multi-Timeframe")
+htfTimeframe     = input.timeframe("D", "Higher Timeframe", group="Multi-Timeframe")
+showCTF          = input.bool(true, "Show Current Timeframe", group="Multi-Timeframe")
+showHTF          = input.bool(true, "Show Higher Timeframe", group="Multi-Timeframe")
+
+// CURRENT TIMEFRAME PARAMETERS
+madLen           = input.int(6, "MAD Length", minval=5, group="CTF Parameters")
+madSlopeLen      = input.int(3, "MAD Slope Length", group="CTF Parameters")
+pressureLen      = input.int(4, "Pressure Length", group="CTF Parameters")
+pressureThresh   = input.float(0.6, "Pressure Threshold", minval=0.1, step=0.1, group="CTF Parameters")
+bwRocLen         = input.int(2, "Band Width ROC Length", group="CTF Parameters")
+effLen           = input.int(4, "Efficiency Length", group="CTF Parameters")
+smoothLen        = input.int(1, "Smoothing Length", group="CTF Parameters")
+
+// HIGHER TIMEFRAME PARAMETERS
+htf_madLen           = input.int(6, "HTF MAD Length", minval=5, group="HTF Parameters")
+htf_madSlopeLen      = input.int(9, "HTF MAD Slope Length", group="HTF Parameters")
+htf_pressureLen      = input.int(6, "HTF Pressure Length", group="HTF Parameters")
+htf_pressureThresh   = input.float(0.6, "HTF Pressure Threshold", minval=0.1, step=0.1, group="HTF Parameters")
+htf_bwRocLen         = input.int(6, "HTF Band Width ROC Length", group="HTF Parameters")
+htf_effLen           = input.int(6, "HTF Efficiency Length", group="HTF Parameters")
+htf_smoothLen        = input.int(1, "HTF Smoothing Length", group="HTF Parameters")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// REGIME CALCULATION FUNCTION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+calcRegime(series float srcData, series float volumeData, int pMadLen, int pMadSlopeLen, int pPressureLen, float pPressureThresh, int pBwRocLen, int pEffLen, int pSmoothLen) =>
+    
+    // 1️⃣ MAD-BASED VOLATILITY
+    medianPrice = ta.percentile_linear_interpolation(srcData, pMadLen, 50)
+    madRaw      = ta.percentile_linear_interpolation(math.abs(srcData - medianPrice), pMadLen, 50)
+    madVol      = 1.4826 * madRaw
+    
+    madSlope = ta.linreg(madVol, pMadSlopeLen, 0)
+    
+    // 2️⃣ PRESSURE MODEL
+    roc        = ta.roc(srcData, 1)
+    volNorm    = volumeData / ta.sma(volumeData, pPressureLen)
+    pressure   = roc * volNorm
+    
+    pressureSmooth = ta.ema(pressure, pSmoothLen)
+    pressureNorm = pressureSmooth / ta.stdev(pressureSmooth, pPressureLen)
+    
+    // 3️⃣ ADAPTIVE PRESSURE BANDS
+    pressureFactor = math.min(math.max(math.abs(pressureNorm), 0.5), 2.0)
+    
+    upperBand = medianPrice + madVol * pressureFactor
+    lowerBand = medianPrice - madVol * pressureFactor
+    
+    bandWidth = upperBand - lowerBand
+    bwRoc = ta.roc(bandWidth, pBwRocLen)
+    
+    // 4️⃣ DIRECTIONAL EFFICIENCY (KER)
+    netMove   = math.abs(srcData - srcData[pEffLen])
+    grossMove = ta.sma(math.abs(srcData - srcData[1]), pEffLen) * pEffLen
+    
+    effRatio  = grossMove != 0 ? netMove / grossMove : 0
+    
+    // 5️⃣ REGIME LOGIC
+    volExpanding   = madSlope > 0
+    volContracting = madSlope <= 0
+    
+    intentStrong   = bwRoc > 0 and pressureNorm > pPressureThresh
+    intentWeak     = bwRoc <= 0
+    
+    efficientMove  = effRatio > 0.35
+    inefficient    = effRatio <= 0.35
+    
+    // 6️⃣ REGIME CLASSIFICATION
+    trendIgnition = volExpanding and intentStrong and efficientMove
+    fakeBreakout = volContracting and intentStrong and inefficient
+    meanReversion = volContracting and intentWeak and inefficient
+    volatilityChurn = volExpanding and intentStrong and inefficient
+    
+    // Return all values as tuple
+    [madVol, madSlope, bwRoc, effRatio, trendIgnition, fakeBreakout, meanReversion, volatilityChurn, pressureNorm]
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CURRENT TIMEFRAME CALCULATION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ctf_madVol, ctf_madSlope, ctf_bwRoc, ctf_effRatio, ctf_trendIgnition, ctf_fakeBreakout, ctf_meanReversion, ctf_volatilityChurn, ctf_pressureNorm] = 
+     calcRegime(src, volume, madLen, madSlopeLen, pressureLen, pressureThresh, bwRocLen, effLen, smoothLen)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HIGHER TIMEFRAME CALCULATION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[htf_madVol_raw, htf_madSlope_raw, htf_bwRoc_raw, htf_effRatio_raw, htf_trendIgnition_raw, htf_fakeBreakout_raw, htf_meanReversion_raw, htf_volatilityChurn_raw, htf_pressureNorm_raw] = 
+     request.security(syminfo.tickerid, htfTimeframe, calcRegime(src, volume, htf_madLen, htf_madSlopeLen, htf_pressureLen, htf_pressureThresh, htf_bwRocLen, htf_effLen, htf_smoothLen))
+
+htf_madVol = enableHTF ? htf_madVol_raw : na
+htf_madSlope = enableHTF ? htf_madSlope_raw : na
+htf_bwRoc = enableHTF ? htf_bwRoc_raw : na
+htf_effRatio = enableHTF ? htf_effRatio_raw : na
+htf_trendIgnition = enableHTF ? htf_trendIgnition_raw : false
+htf_fakeBreakout = enableHTF ? htf_fakeBreakout_raw : false
+htf_meanReversion = enableHTF ? htf_meanReversion_raw : false
+htf_volatilityChurn = enableHTF ? htf_volatilityChurn_raw : false
+htf_pressureNorm = enableHTF ? htf_pressureNorm_raw : na
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// VISUALIZATION - CURRENT TIMEFRAME
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plot(showCTF ? ctf_madVol : na, title="CTF MAD Volatility", color=color.orange, linewidth=2)
+plot(showCTF ? ctf_madSlope : na, title="CTF MAD Slope", color=color.blue, linewidth=2)
+plot(showCTF ? ctf_bwRoc : na, title="CTF Pressure Band Width ROC", color=color.fuchsia, linewidth=2)
+plot(showCTF ? ctf_effRatio : na, title="CTF Efficiency Ratio", color=color.teal, linewidth=2)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// VISUALIZATION - HIGHER TIMEFRAME
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plot(showHTF and enableHTF ? htf_madVol : na, title="HTF MAD Volatility", color=color.new(color.orange, 0), linewidth=1, style=plot.style_circles)
+plot(showHTF and enableHTF ? htf_madSlope : na, title="HTF MAD Slope", color=color.new(color.blue, 0), linewidth=1, style=plot.style_circles)
+plot(showHTF and enableHTF ? htf_bwRoc : na, title="HTF Pressure Band Width ROC", color=color.new(color.fuchsia, 0), linewidth=1, style=plot.style_circles)
+plot(showHTF and enableHTF ? htf_effRatio : na, title="HTF Efficiency Ratio", color=color.new(color.teal, 0), linewidth=1, style=plot.style_circles)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// REGIME BACKGROUND - CURRENT TIMEFRAME
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bgcolor(showCTF and ctf_trendIgnition ? color.new(color.green, 80) : 
+     showCTF and ctf_meanReversion ? color.new(color.blue, 85) : 
+     showCTF and ctf_fakeBreakout ? color.new(color.red, 85) : 
+     showCTF and ctf_volatilityChurn ? color.new(color.orange, 85) : na, title="CTF Regime")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// REGIME BACKGROUND - HIGHER TIMEFRAME
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bgcolor(showHTF and enableHTF and htf_trendIgnition ? color.new(color.green, 90) : 
+     showHTF and enableHTF and htf_meanReversion ? color.new(color.blue, 92) : 
+     showHTF and enableHTF and htf_fakeBreakout ? color.new(color.red, 92) : 
+     showHTF and enableHTF and htf_volatilityChurn ? color.new(color.orange, 92) : na, title="HTF Regime")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// REGIME LABELS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var label ctfLabel = na
+var label htfLabel = na
+
+if barstate.islast
+    // Current Timeframe Label
+    if showCTF
+        label.delete(ctfLabel)
+        ctfRegimeText = ctf_trendIgnition ? "TREND IGNITION" : 
+             ctf_meanReversion ? "MEAN REVERSION" : 
+             ctf_fakeBreakout ? "FAKE BREAKOUT" : 
+             ctf_volatilityChurn ? "VOLATILITY CHURN" : "NEUTRAL"
+        
+        ctfLabel := label.new(bar_index, ctf_madVol, 
+             "CTF: " + ctfRegimeText, 
+             style=label.style_label_down,
+             textcolor=color.white,
+             color=color.black,
+             size=size.normal)
+    
+    // Higher Timeframe Label
+    if showHTF and enableHTF
+        label.delete(htfLabel)
+        htfRegimeText = htf_trendIgnition ? "TREND IGNITION" : 
+             htf_meanReversion ? "MEAN REVERSION" : 
+             htf_fakeBreakout ? "FAKE BREAKOUT" : 
+             htf_volatilityChurn ? "VOLATILITY CHURN" : "NEUTRAL"
+        
+        htfLabel := label.new(bar_index, htf_madVol * 0.9, 
+             "HTF (" + htfTimeframe + "): " + htfRegimeText, 
+             style=label.style_label_up,
+             textcolor=color.white,
+             color=color.gray,
+             size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// REGIME ALIGNMENT INDICATOR
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+regimeAlignment = enableHTF and showCTF and showHTF ? 
+     (ctf_trendIgnition and htf_trendIgnition) or 
+     (ctf_meanReversion and htf_meanReversion) or
+     (ctf_fakeBreakout and htf_fakeBreakout) or
+     (ctf_volatilityChurn and htf_volatilityChurn) : na
+
+// Plot alignment indicator at bottom
+hline(0, "Zero Line", color=color.gray, linestyle=hline.style_dotted)
+plot(enableHTF and showCTF and showHTF ? (regimeAlignment ? 1 : -1) : na, 
+     title="Regime Alignment", 
+     color=regimeAlignment ? color.new(color.green, 50) : color.new(color.red, 50),
+     style=plot.style_histogram,
+     linewidth=3)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TABLE - REGIME SUMMARY
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var table regimeTable = table.new(position.top_right, 3, 3, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast and (showCTF or (showHTF and enableHTF))
+    // Headers
+    table.cell(regimeTable, 0, 0, "Timeframe", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(regimeTable, 1, 0, "Regime", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(regimeTable, 2, 0, "Efficiency", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    
+    // Current Timeframe Row
+    if showCTF
+        ctfRegime = ctf_trendIgnition ? "🚀 TREND" : ctf_meanReversion ? "🔄 MEAN REV" : ctf_fakeBreakout ? "⚠️ FAKE" : ctf_volatilityChurn ? "🌪️ CHURN" : "⚪ NEUTRAL"
+        table.cell(regimeTable, 0, 1, "CTF", text_color=color.white)
+        table.cell(regimeTable, 1, 1, ctfRegime, text_color=color.white)
+        table.cell(regimeTable, 2, 1, str.tostring(math.round(ctf_effRatio * 100)) + "%", text_color=color.white)
+    
+    // Higher Timeframe Row
+    if showHTF and enableHTF
+        htfRegime = htf_trendIgnition ? "🚀 TREND" : htf_meanReversion ? "🔄 MEAN REV" : htf_fakeBreakout ? "⚠️ FAKE" : htf_volatilityChurn ? "🌪️ CHURN" : "⚪ NEUTRAL"
+        table.cell(regimeTable, 0, 2, htfTimeframe, text_color=color.yellow)
+        table.cell(regimeTable, 1, 2, htfRegime, text_color=color.yellow)
+        table.cell(regimeTable, 2, 2, str.tostring(math.round(htf_effRatio * 100)) + "%", text_color=color.yellow)

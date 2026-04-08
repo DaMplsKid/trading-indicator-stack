@@ -1,0 +1,452 @@
+//@version=5
+indicator("Reversal Regime Stack — RSX ROC + WAE Gate (JMA Impulse)", overlay=true, max_labels_count=500)
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+grpTrend = "Layer 1 — Trend Exists (Context)"
+erLen          = input.int(2, "Price ER Length", minval=2, group=grpTrend)
+erThreshold    = input.float(0.20, "Price ER Threshold", step=0.01, group=grpTrend)
+momPersistLen  = input.int(5, "Momentum Direction Persistence", minval=1, group=grpTrend)
+
+grpMom = "Layer 2 — Momentum (RSX ROC)"
+src            = input.source(close, "RSX Source", group=grpMom)
+rsxLen         = input.int(3, "RSX Length", minval=1, group=grpMom)
+rsxPhase       = input.float(100, "RSX Phase (-100 to 100)", step=1, minval=-100, maxval=100, group=grpMom)
+rsxPower       = input.int(4, "RSX Power", minval=1, maxval=10, group=grpMom)
+rsxSmoothLen   = input.int(5, "RSX Smoothing", minval=1, group=grpMom)
+
+rocLen         = input.int(5, "RSX ROC Length", minval=1, group=grpMom)
+rocSmooth      = input.int(5, "RSX ROC Smoothing", minval=1, group=grpMom)
+rocNormalize   = input.bool(true, "Normalize ROC (divide by length)", group=grpMom)
+
+momERLen       = input.int(8, "Momentum ER Length", minval=2, group=grpMom)
+momExtremeBandLen = input.int(8, "Momentum MAD Band Length", minval=5, group=grpMom)
+momExtremeBandMult = input.float(0.518, "Momentum MAD Band Multiplier", step=0.1, group=grpMom)
+divLookback    = input.int(8, "Momentum Divergence Lookback", minval=5, group=grpMom)
+
+grpWAE = "WAE Gate (Minimal)"
+sensitivity   = input.int(7, title="Sensitivity", group=grpWAE)
+volLength     = input.int(5, "Volatility JMA Length (Fast)", minval=1, group=grpWAE)
+volPhase      = input.int(50, "Volatility JMA Phase", minval=-100, maxval=100, group=grpWAE)
+volPower      = input.int(2, "Volatility JMA Power", minval=1, group=grpWAE)
+volatilityLength = input.int(7, "Volatility Period", minval=1, group=grpWAE)
+volatilityType = input.string("ATR", "Volatility Type", options=["ATR", "Standard Deviation", "True Range"], group=grpWAE)
+
+vwjmaLength = input.int(16, "VW-JMA Length (Slow)", minval=1, group=grpWAE)
+vwjmaPhase  = input.int(50, "VW-JMA Phase", minval=-100, maxval=100, group=grpWAE)
+vwjmaPower  = input.int(2, "VW-JMA Power", minval=1, group=grpWAE)
+minVolumeThreshold = input.float(50.0, "Min Volume Threshold (% of avg)", minval=0.1, maxval=100, group=grpWAE)
+useExtendedHours = input.bool(true, "Detect Extended Hours", group=grpWAE)
+vwjmaSmoothing = input.int(9, "VW-JMA Smoothing", minval=1, maxval=10, group=grpWAE)
+
+grpTrig = "Layer 4 — Structural Failure (Trigger condition)"
+impulseMeanLen = input.int(16, "Impulse Mean Length (JMA)", group=grpTrig)
+impulseJmaPhase = input.int(30, "Impulse JMA Phase", minval=-100, maxval=100, group=grpTrig)
+impulseJmaPower = input.int(3, "Impulse JMA Power", minval=1, maxval=10, group=grpTrig)
+swingLen       = input.int(10, "Swing Structure Length", minval=2, group=grpTrig)
+minFlipBars    = input.int(1, "Min bars after compression before trigger", minval=0, group=grpTrig)
+
+grpViz = "Visuals"
+showRegimeBg = input.bool(true, "Background regime shading", group=grpViz)
+showMarkers = input.bool(true, "Show reversal markers", group=grpViz)
+
+//------------------------------------------------------------------------------
+// HTF Structure (Permission Gate)
+//------------------------------------------------------------------------------
+grpHTF = "HTF Structure (Permission Gate)"
+useHTF = input.bool(true, "Enable HTF structure failure gate", group=grpHTF)
+htfTimeframe = input.timeframe("15", "HTF Timeframe", group=grpHTF)
+htfFailMinBody = input.float(0.30, "Min body % for directional candle", step=0.05, group=grpHTF)
+htfWickRejection = input.float(2.0, "Wick rejection ratio (vs body)", step=0.1, group=grpHTF)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_sum_abs_change(_src, _len) =>
+    float s = 0.0
+    for i = 0 to _len - 1
+        s += math.abs(_src[i] - _src[i + 1])
+    s
+
+f_er(_src, _len) =>
+    dir = math.abs(_src - _src[_len])
+    vol = f_sum_abs_change(_src, _len)
+    vol == 0.0 ? 0.0 : dir / vol
+
+f_mad(_src, _len) =>
+    basis = ta.sma(_src, _len)
+    ta.sma(math.abs(_src - basis), _len)
+
+f_zscore(_src, _len) =>
+    m = ta.sma(_src, _len)
+    s = ta.stdev(_src, _len)
+    s == 0.0 ? 0.0 : (_src - m) / s
+
+f_sign_persistent(_src, _len) =>
+    sgnNow = _src >= 0 ? 1 : -1
+    float same = 0.0
+    for i = 0 to _len - 1
+        sgnI = _src[i] >= 0 ? 1 : -1
+        same += (sgnI == sgnNow) ? 1.0 : 0.0
+    same / _len
+
+// RSX (phase + power)
+rsx(_src, _length, _phase, _power) =>
+    mom = ta.change(_src)
+    beta = 0.45 * (_length - 1) / (0.45 * (_length - 1) + 2)
+    alpha = math.pow(beta, _power)
+    phaseRatio = _phase < -100 ? 0.5 : _phase > 100 ? 2.5 : _phase / 100 + 1.5
+
+    var float v1 = 0.0
+    var float v2 = 0.0
+    var float v3 = 0.0
+    var float v4 = 0.0
+
+    v1 := (1 - alpha) * mom + alpha * nz(v1[1])
+    v2 := (1 - alpha) * v1 + alpha * nz(v2[1])
+    v2_adj = v1 + phaseRatio * (v2 - v1)
+
+    absM = math.abs(mom)
+    v3 := (1 - alpha) * absM + alpha * nz(v3[1])
+    v4 := (1 - alpha) * v3 + alpha * nz(v4[1])
+    v4_adj = v3 + phaseRatio * (v4 - v3)
+
+    v5 = v4_adj != 0 ? v2_adj / v4_adj * 100 : 0
+
+    var float v6 = 0.0
+    v6 := (1 - alpha) * v5 + alpha * nz(v6[1])
+
+    rsxVal = v6 - 50
+    rsxVal
+
+// JMA (for VW-JMA fallback + impulse mean)
+jma_func(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jma_val = na
+    e0 := (1 - alpha) * src + alpha * nz(e0[1], src)
+    e1 := (src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jma_val[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jma_val := e2 + nz(jma_val[1], src)
+    jma_val
+
+//------------------------------------------------------------------------------
+// Core series
+//------------------------------------------------------------------------------
+price = close
+
+// RSX ROC Momentum
+rsxVal = rsx(src, rsxLen, rsxPhase, rsxPower)
+rsxSmooth = rsxSmoothLen > 1 ? ta.ema(rsxVal, rsxSmoothLen) : rsxVal
+
+rsxROC_raw = ta.change(rsxSmooth, rocLen)
+rsxROC_norm = rocNormalize ? rsxROC_raw / rocLen : rsxROC_raw
+rsxROC = rocSmooth > 1 ? ta.ema(rsxROC_norm, rocSmooth) : rsxROC_norm
+
+// ER on price
+erPrice = f_er(price, erLen)
+
+// Momentum direction persistence gate
+momPersist = f_sign_persistent(rsxROC, momPersistLen)
+momDirPersistent = momPersist > 0.70
+
+// Trend direction (for regime coloring)
+trendDir  = ta.ema(price - price[1], 5)
+isUpTrend = trendDir > 0
+isDnTrend = trendDir < 0
+
+//------------------------------------------------------------------------------
+// WAE Core (minimal)
+//------------------------------------------------------------------------------
+DEAD_ZONE = ta.rma(ta.tr(true), 100) * 3.7
+
+volatility = switch volatilityType
+    "ATR" => ta.atr(volatilityLength)
+    "Standard Deviation" => ta.stdev(close, volatilityLength)
+    "True Range" => ta.tr
+    => ta.atr(volatilityLength)
+
+volatility := na(volatility) or volatility == 0 ? 1 : volatility
+volatilityWeight = volatility / ta.ema(volatility, volatilityLength)
+weightedSrc = close * volatilityWeight
+
+volPhaseRatio = volPhase < -100 ? 0.5 : volPhase > 100 ? 2.5 : volPhase / 100 + 1.5
+volBeta = 0.45 * (volLength - 1) / (0.45 * (volLength - 1) + 2)
+volAlpha = math.pow(volBeta, volPower)
+
+var float vol_e0_vw = 0.0
+vol_e0_vw := (1 - volAlpha) * weightedSrc + volAlpha * vol_e0_vw
+
+var float vol_e1_vw = 0.0
+vol_e1_vw := (weightedSrc - vol_e0_vw) * (1 - volBeta) + volBeta * vol_e1_vw
+
+var float vol_e2_vw = 0.0
+var float vol_jma_vw = 0.0
+vol_e2_vw := (vol_e0_vw + volPhaseRatio * vol_e1_vw - vol_jma_vw) * math.pow(1 - volAlpha, 2) + math.pow(volAlpha, 2) * vol_e2_vw
+vol_jma_vw := vol_e2_vw + vol_jma_vw
+
+var float vol_e0_vol = 0.0
+vol_e0_vol := (1 - volAlpha) * volatilityWeight + volAlpha * vol_e0_vol
+
+var float vol_e1_vol = 0.0
+vol_e1_vol := (volatilityWeight - vol_e0_vol) * (1 - volBeta) + volBeta * vol_e1_vol
+
+var float vol_e2_vol = 0.0
+var float vol_jma_vol = 0.0
+vol_e2_vol := (vol_e0_vol + volPhaseRatio * vol_e1_vol - vol_jma_vol) * math.pow(1 - volAlpha, 2) + math.pow(volAlpha, 2) * vol_e2_vol
+vol_jma_vol := vol_e2_vol + vol_jma_vol
+
+volatilityJMA = vol_jma_vol != 0 ? vol_jma_vw / vol_jma_vol : close
+
+// Volume-Weighted JMA (slow)
+isExtendedHours = useExtendedHours ? not na(time(timeframe.period, "0930-1600", "America/New_York")) == false : false
+avgVolume = ta.sma(volume, vwjmaLength * 2)
+volThreshold = avgVolume * (minVolumeThreshold / 100.0)
+isLowVolume = volume < volThreshold or isExtendedHours
+
+volumeStdev = ta.stdev(volume, vwjmaLength)
+volumeChange = math.abs(volume - volume[1])
+isErraticVolume = volumeStdev > 0 and volumeChange > (volumeStdev * 3)
+
+useRegularJMA = isLowVolume or isErraticVolume
+regularJMA = jma_func(close, vwjmaLength, vwjmaPhase, vwjmaPower)
+
+vwjmaPhaseRatio = vwjmaPhase < -100 ? 0.5 : vwjmaPhase > 100 ? 2.5 : vwjmaPhase / 100 + 1.5
+vwjmaBeta = 0.45 * (vwjmaLength - 1) / (0.45 * (vwjmaLength - 1) + 2)
+vwjmaAlpha = math.pow(vwjmaBeta, vwjmaPower)
+
+maxVolume = avgVolume * 5
+minVolume = avgVolume * 0.1
+clampedVolume = math.max(minVolume, math.min(volume, maxVolume))
+
+normalizedVolume = clampedVolume > 0 ? clampedVolume : 1.0
+vwPrice = close * normalizedVolume
+smoothVol = normalizedVolume
+
+var float vwjma_e0_vw = 0.0
+vwjma_e0_vw := (1 - vwjmaAlpha) * vwPrice + vwjmaAlpha * vwjma_e0_vw
+
+var float vwjma_e1_vw = 0.0
+vwjma_e1_vw := (vwPrice - vwjma_e0_vw) * (1 - vwjmaBeta) + vwjmaBeta * vwjma_e1_vw
+
+var float vwjma_e2_vw = 0.0
+var float vwjma_jma_numerator = 0.0
+vwjma_e2_vw := (vwjma_e0_vw + vwjmaPhaseRatio * vwjma_e1_vw - vwjma_jma_numerator) * math.pow(1 - vwjmaAlpha, 2) + math.pow(vwjmaAlpha, 2) * vwjma_e2_vw
+vwjma_jma_numerator := vwjma_e2_vw + vwjma_jma_numerator
+
+var float vwjma_e0_vol = 0.0
+vwjma_e0_vol := (1 - vwjmaAlpha) * smoothVol + vwjmaAlpha * vwjma_e0_vol
+
+var float vwjma_e1_vol = 0.0
+vwjma_e1_vol := (smoothVol - vwjma_e0_vol) * (1 - vwjmaBeta) + vwjmaBeta * vwjma_e1_vol
+
+var float vwjma_e2_vol = 0.0
+var float vwjma_jma_denominator = 0.0
+vwjma_e2_vol := (vwjma_e0_vol + vwjmaPhaseRatio * vwjma_e1_vol - vwjma_jma_denominator) * math.pow(1 - vwjmaAlpha, 2) + math.pow(vwjmaAlpha, 2) * vwjma_e2_vol
+vwjma_jma_denominator := vwjma_e2_vol + vwjma_jma_denominator
+
+volumeWeightedJMA_raw = vwjma_jma_denominator != 0 ? vwjma_jma_numerator / vwjma_jma_denominator : close
+priceDeviation = math.abs(volumeWeightedJMA_raw - close) / close
+isTooDeviated = priceDeviation > 0.05
+
+volumeWeightedJMA_temp = (useRegularJMA or isTooDeviated) ? regularJMA : volumeWeightedJMA_raw
+
+smoothingAlpha = 2.0 / (vwjmaSmoothing + 1)
+var float volumeWeightedJMA = na
+volumeWeightedJMA := na(volumeWeightedJMA) ? volumeWeightedJMA_temp : smoothingAlpha * volumeWeightedJMA_temp + (1 - smoothingAlpha) * volumeWeightedJMA
+
+if useRegularJMA
+    extraSmoothing = 2.0 / (vwjmaSmoothing * 2 + 1)
+    volumeWeightedJMA := extraSmoothing * volumeWeightedJMA_temp + (1 - extraSmoothing) * volumeWeightedJMA
+
+macd_value = volatilityJMA - volumeWeightedJMA
+macd_value_prev = volatilityJMA[1] - volumeWeightedJMA[1]
+t1 = (macd_value - macd_value_prev) * sensitivity
+
+waeGate = math.abs(t1) > DEAD_ZONE
+compression = math.abs(t1) < DEAD_ZONE
+
+trendExit = (isUpTrend and ta.crossunder(price, volumeWeightedJMA)) or (isDnTrend and ta.crossover(price, volumeWeightedJMA))
+
+//------------------------------------------------------------------------------
+// Layer 1 — Trend existed
+//------------------------------------------------------------------------------
+trendExists = (erPrice > erThreshold) and waeGate and momDirPersistent and not trendExit
+
+//------------------------------------------------------------------------------
+// Layer 2 — Efficiency decay
+//------------------------------------------------------------------------------
+momSwingHigh = ta.pivothigh(rsxROC, swingLen, swingLen)
+momSwingLow  = ta.pivotlow(rsxROC, swingLen, swingLen)
+
+var float lastMomHigh = na
+var float prevMomHigh = na
+if not na(momSwingHigh)
+    prevMomHigh := lastMomHigh
+    lastMomHigh := momSwingHigh
+
+var float lastMomLow = na
+var float prevMomLow = na
+if not na(momSwingLow)
+    prevMomLow := lastMomLow
+    lastMomLow := momSwingLow
+
+momDivUp = isUpTrend and (not na(lastMomHigh) and not na(prevMomHigh)) and (lastMomHigh < prevMomHigh)
+momDivDn = isDnTrend and (not na(lastMomLow) and not na(prevMomLow)) and (lastMomLow > prevMomLow)
+momDiverging = momDivUp or momDivDn
+
+erMom = f_er(rsxROC, momERLen)
+erMomFalling = erMom < erMom[1] and erMom < ta.sma(erMom, math.max(5, momERLen / 4))
+efficiencyDecay = momDiverging and erMomFalling
+
+//------------------------------------------------------------------------------
+// Exhaustion (MAD band extremes + divergence)
+//------------------------------------------------------------------------------
+momMadBand = momExtremeBandMult * f_mad(rsxROC, momExtremeBandLen)
+momExtreme = math.abs(rsxROC) > momMadBand
+
+atr = ta.atr(14)
+atrZ = f_zscore(atr, 100)
+volPeaked = (atrZ > 1.0) and (atrZ < atrZ[1])
+
+exhaustion = momExtreme and (momDiverging or erMomFalling) and volPeaked
+
+//------------------------------------------------------------------------------
+// Layer 4 — Structural failure (Trigger)
+//------------------------------------------------------------------------------
+impulseMean = jma_func(price, impulseMeanLen, impulseJmaPhase, impulseJmaPower)
+
+breakOfImpulseMeanUpToDown = isUpTrend and ta.crossunder(price, impulseMean)
+breakOfImpulseMeanDnToUp   = isDnTrend and ta.crossover(price, impulseMean)
+breakOfImpulseMean = breakOfImpulseMeanUpToDown or breakOfImpulseMeanDnToUp
+
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastPH = na
+var float prevPH = na
+if not na(ph)
+    prevPH := lastPH
+    lastPH := ph
+
+var float lastPL = na
+var float prevPL = na
+if not na(pl)
+    prevPL := lastPL
+    lastPL := pl
+
+failHH = isUpTrend and (not na(lastPH) and not na(prevPH)) and (lastPH <= prevPH)
+failLL = isDnTrend and (not na(lastPL) and not na(prevPL)) and (lastPL >= prevPL)
+structFail = failHH or failLL
+
+momAbs = math.abs(rsxROC)
+momAbsAvg = ta.sma(momAbs, 10)
+oppMomExpansionUpToDown = isUpTrend and (rsxROC < 0) and (momAbs > momAbsAvg)
+oppMomExpansionDnToUp   = isDnTrend and (rsxROC > 0) and (momAbs > momAbsAvg)
+oppMomExpansion = oppMomExpansionUpToDown or oppMomExpansionDnToUp
+
+reversalTrigger = breakOfImpulseMean or (structFail and oppMomExpansion) or oppMomExpansion
+
+//------------------------------------------------------------------------------
+// HTF Structure Failure Gate
+//------------------------------------------------------------------------------
+[htfOpen, htfHigh, htfLow, htfClose] = request.security(syminfo.tickerid, htfTimeframe, [open, high, low, close], lookahead=barmerge.lookahead_off)
+
+htfRange = htfHigh - htfLow
+htfBody = math.abs(htfClose - htfOpen)
+htfBodyPct = htfRange > 0 ? htfBody / htfRange : 0.0
+
+htfIsBull = htfClose > htfOpen
+htfIsBear = htfClose < htfOpen
+
+htfUpperWick = htfHigh - math.max(htfOpen, htfClose)
+htfLowerWick = math.min(htfOpen, htfClose) - htfLow
+
+htfMidpoint = (htfHigh + htfLow) / 2.0
+htfClosedUpperHalf = htfClose > htfMidpoint
+htfClosedLowerHalf = htfClose < htfMidpoint
+
+htfFailedBullAttempt = htfRange > 0 and
+                       (htfUpperWick > htfBody * htfWickRejection) and
+                       htfClosedLowerHalf and
+                       htfBodyPct > htfFailMinBody
+
+htfFailedBearAttempt = htfRange > 0 and
+                       (htfLowerWick > htfBody * htfWickRejection) and
+                       htfClosedUpperHalf and
+                       htfBodyPct > htfFailMinBody
+
+htfBullAbsorbed = htfIsBull and
+                  htfClosedLowerHalf and
+                  (htfUpperWick > htfBody * 1.0) and
+                  htfBodyPct > htfFailMinBody
+
+htfBearAbsorbed = htfIsBear and
+                  htfClosedUpperHalf and
+                  (htfLowerWick > htfBody * 1.0) and
+                  htfBodyPct > htfFailMinBody
+
+htfBullsFailed = htfFailedBullAttempt or htfBullAbsorbed
+htfBearsFailed = htfFailedBearAttempt or htfBearAbsorbed
+
+// Gate flags (permission layer)
+htfStructFailForLong  = useHTF ? htfBearsFailed : false
+htfStructFailForShort = useHTF ? htfBullsFailed : false
+
+// Top-of-pane markers
+plotshape(htfStructFailForLong,  title="HTF Fail → Long Bias",  style=shape.triangleup,   text="HTF L", color=color.new(color.lime, 0),  textcolor=color.white, location=location.top, size=size.tiny)
+plotshape(htfStructFailForShort, title="HTF Fail → Short Bias", style=shape.triangledown, text="HTF S", color=color.new(color.red, 0),   textcolor=color.white, location=location.top, size=size.tiny)
+
+//------------------------------------------------------------------------------
+// Sequencing: Yellow → Gray → Trigger
+//------------------------------------------------------------------------------
+var int lastExhaustBar = na
+var int lastCompressBar = na
+
+if trendExists and exhaustion
+    lastExhaustBar := bar_index
+
+if trendExists and compression
+    lastCompressBar := bar_index
+
+hadRecentExhaust = not na(lastExhaustBar) and (bar_index - lastExhaustBar <= 50)
+hadRecentCompress = not na(lastCompressBar) and (bar_index - lastCompressBar <= 50)
+
+sequenceOK = hadRecentExhaust and hadRecentCompress and (lastExhaustBar < lastCompressBar)
+compressAgeOK = not na(lastCompressBar) and (bar_index - lastCompressBar >= minFlipBars)
+
+reversal = trendExists and sequenceOK and compressAgeOK and reversalTrigger
+
+reversalShort = reversal and (isUpTrend or breakOfImpulseMeanUpToDown or oppMomExpansionUpToDown) and (rsxROC < 0)
+reversalLong  = reversal and (isDnTrend or breakOfImpulseMeanDnToUp   or oppMomExpansionDnToUp)   and (rsxROC > 0)
+
+//------------------------------------------------------------------------------
+// Visual encoding
+//------------------------------------------------------------------------------
+regimeColor =
+     trendExists and compression ? color.new(color.gray, 80) :
+     trendExists and exhaustion  ? color.new(color.yellow, 80) :
+     trendExists and isUpTrend   ? color.new(color.lime, 85) :
+     trendExists and isDnTrend   ? color.new(color.red, 85) :
+     color.new(color.black, 100)
+
+bgCol = showRegimeBg ? regimeColor : na
+bgcolor(bgCol)
+
+// Markers
+if showMarkers and reversalLong
+    label.new(bar_index, low, "REV ↑", style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0))
+if showMarkers and reversalShort
+    label.new(bar_index, high, "REV ↓", style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0))
+
+// Debug plots (no RSX ROC plot per request)
+plot(erPrice, "ER Price", color=color.new(color.blue, 0))
+plot(erMom, "ER Momentum", color=color.new(color.purple, 0))
+// JMA color based on slope
+impulseMeanColor = impulseMean > impulseMean[1] ? color.lime : color.red
+plot(impulseMean, "Impulse Mean (JMA)", color=impulseMeanColor)

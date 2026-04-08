@@ -1,0 +1,358 @@
+//@version=5
+indicator("Ehlers Hybrid Reversal System", shorttitle="EHRS Pro", overlay=false, max_lines_count=500)
+
+// ====================================================
+// ===================== INPUTS =======================
+// ====================================================
+
+// Core Components
+jcma_len        = input.int(21, "JCMA Length", group="Core")
+cc_short        = input.int(8, "Cycle Short EMA", group="Core")
+cc_long         = input.int(21, "Cycle Long EMA", group="Core")
+cc_norm_len     = input.int(64, "Cycle Normalizer", group="Core")
+rsx_len         = input.int(14, "RSX Length", group="Core")
+osc_smoothing   = input.int(2, "Oscillator Smoothing", minval=0, group="Core")
+
+// MAD & Volatility
+mad_len         = input.int(50, "MAD Length", group="Volatility")
+mad_k_entry     = input.float(1.6, "MAD Entry Z-Score", group="Volatility")
+mad_k_extreme   = input.float(2.5, "MAD Extreme Z-Score", group="Volatility")
+
+// Hurst & Regime
+hurst_max       = input.int(256, "Hurst Max Window", group="Regime")
+hurst_exps      = input.string("6,7,8", "Hurst Exponents", group="Regime")
+hurst_min_scales= input.int(3, "Min Scales", group="Regime")
+hurst_trend     = input.float(0.55, "Trend Threshold", group="Regime")
+hurst_revert    = input.float(0.45, "Revert Threshold", group="Regime")
+
+// Divergence Settings
+div_lookback    = input.int(5, "Divergence Lookback", group="Divergence")
+div_threshold   = input.int(2, "Min Divergence Score", minval=1, maxval=3, group="Divergence")
+
+// Display Options
+show_mad_bands  = input.bool(true, "Show MAD Bands", group="Display")
+show_hurst      = input.bool(true, "Show Hurst Line", group="Display")
+show_rsx        = input.bool(true, "Show RSX", group="Display")
+show_regime_bg  = input.bool(true, "Show Regime Background", group="Display")
+show_signals    = input.bool(true, "Show Entry Signals", group="Display")
+show_divergence = input.bool(true, "Show Divergence", group="Display")
+show_diagnostics= input.bool(true, "Show Diagnostics", group="Display")
+
+// ====================================================
+// ===================== HELPERS ======================
+// ====================================================
+
+// Super Smoother (Ehlers)
+f_supersmoother(src, len) =>
+    n = math.max(2, len)
+    a1 = math.exp(-1.41421356237 * math.pi / n)
+    b1 = 2 * a1 * math.cos(1.41421356237 * math.pi / n)
+    c2 = b1
+    c3 = -(a1 * a1)
+    c1 = 1 - c2 - c3
+    var float out = na
+    out := na(out) ? src : c1 * (src + src[1]) / 2 + c2 * nz(out[1]) + c3 * nz(out[2])
+    out
+
+// Rolling Median
+rolling_median(src, len) =>
+    float out = na
+    if bar_index >= len - 1
+        var float[] a = array.new_float(0)
+        array.clear(a)
+        for i = 0 to len - 1
+            array.push(a, src[i])
+        array.sort(a)
+        mid = math.floor(len / 2)
+        out := (len % 2 == 1) ? array.get(a, mid) : (array.get(a, mid - 1) + array.get(a, mid)) / 2.0
+    out
+
+// Rolling MAD
+rolling_mad(src, len) =>
+    med = rolling_median(src, len)
+    if na(med)
+        na
+    else
+        var float[] a = array.new_float(0)
+        array.clear(a)
+        for i = 0 to len - 1
+            array.push(a, math.abs(src[i] - med))
+        array.sort(a)
+        mid = math.floor(len / 2)
+        (len % 2 == 1) ? array.get(a, mid) : (array.get(a, mid - 1) + array.get(a, mid)) / 2.0
+
+// RSX (Jurik-style smoothed RSI)
+f_rsx(src, len) =>
+    mom = ta.change(src)
+    f1 = 3.0 / (len + 2.0)
+    f2 = 1.0 - f1
+    var float aU = 0.0
+    var float aD = 0.0
+    aU := f1 * math.max(mom, 0) + f2 * nz(aU[1])
+    aD := f1 * math.max(-mom, 0) + f2 * nz(aD[1])
+    rs = aD != 0 ? aU / aD : 1.0
+    100.0 - (100.0 / (1.0 + rs))
+
+// Parse scales for Hurst
+f_get_scales(expStr, maxWindow) =>
+    var int[] arr = array.new_int(0)
+    array.clear(arr)
+    parts = str.split(expStr, ",")
+    for p in parts
+        e = str.tonumber(str.trim(p))
+        if not na(e)
+            sz = int(math.round(math.pow(2, e)))
+            if sz <= maxWindow
+                array.push(arr, sz)
+    arr
+
+// R/S Calculation (Fixed)
+f_RS(series, scaleArg) =>
+    sc = int(scaleArg)
+    if bar_index < sc
+        na
+    else
+        sumv = 0.0
+        for i = 0 to sc - 1
+            sumv += series[i]
+        mean = sumv / sc
+        cum = 0.0
+        cumMax = -1e10
+        cumMin = 1e10
+        ssum = 0.0
+        for i = 0 to sc - 1
+            dev = series[i] - mean
+            cum := cum + dev
+            cumMax := math.max(cumMax, cum)
+            cumMin := math.min(cumMin, cum)
+            ssum += dev * dev
+        R = cumMax - cumMin
+        S = math.sqrt(ssum / sc)
+        (S != 0) ? (R / S) : na
+
+// Hurst Exponent
+f_hurst(src, maxW, expStr, minSc) =>
+    scales = f_get_scales(expStr, maxW)
+    cnt = array.size(scales)
+    var float[] X = array.new_float(0)
+    var float[] Y = array.new_float(0)
+    array.clear(X)
+    array.clear(Y)
+    for i = 0 to cnt - 1
+        sc = array.get(scales, i)
+        if bar_index >= sc
+            r = f_RS(src, sc)
+            if not na(r) and r > 0
+                array.push(X, math.log(sc))
+                array.push(Y, math.log(r))
+    N = array.size(X)
+    if N < minSc
+        na
+    else
+        sumX = 0.0
+        sumY = 0.0
+        sumXY = 0.0
+        sumXX = 0.0
+        for i = 0 to N - 1
+            xx = array.get(X, i)
+            yy = array.get(Y, i)
+            sumX  := sumX  + xx
+            sumY  := sumY  + yy
+            sumXY := sumXY + xx * yy
+            sumXX := sumXX + xx * xx
+        denom = (N * sumXX - sumX * sumX)
+        if denom != 0.0
+            slope = (N * sumXY - sumX * sumY) / denom
+            math.max(0.0, math.min(1.5, slope))
+        else
+            na
+
+// Pivot Detection
+is_pivot_high(src, lb, rb) =>
+    bool result = true
+    for i = 1 to lb
+        if src[i] > src[0]
+            result := false
+            break
+    if result
+        for i = 1 to rb
+            if src >= src[i]
+                result := true
+            else
+                result := false
+                break
+    result
+
+is_pivot_low(src, lb, rb) =>
+    bool result = true
+    for i = 1 to lb
+        if src[i] < src[0]
+            result := false
+            break
+    if result
+        for i = 1 to rb
+            if src <= src[i]
+                result := true
+            else
+                result := false
+                break
+    result
+
+// ====================================================
+// ============== CORE CALCULATIONS ===================
+// ====================================================
+
+// A. JCMA Trend Backbone
+jcma = f_supersmoother(close, jcma_len)
+jcma_slope = jcma - nz(jcma[1])
+jcma_slope_pos = jcma_slope > 0
+
+// B. Cyber Cycle Oscillator
+ema_s = ta.ema(close, cc_short)
+ema_l = ta.ema(close, cc_long)
+raw_cycle = ema_s - ema_l
+norm = ta.sma(math.abs(raw_cycle), cc_norm_len)
+cyber = (norm != 0) ? raw_cycle / norm : 0.0
+cyber_sm = osc_smoothing > 0 ? ta.ema(cyber, osc_smoothing) : cyber
+
+// C. RSX
+rsx = f_rsx(close, rsx_len)
+rsx_osc = (rsx - 50) / 50  // Normalized to [-1, 1]
+
+// D. MAD Bands (Z-Score)
+mad_val = rolling_mad(cyber_sm, mad_len)
+mad_scaled = na(mad_val) ? na : mad_val * 1.4826
+upper_entry = na(mad_scaled) ? na : mad_k_entry * mad_scaled
+lower_entry = na(mad_scaled) ? na : -mad_k_entry * mad_scaled
+upper_ext = na(mad_scaled) ? na : mad_k_extreme * mad_scaled
+lower_ext = na(mad_scaled) ? na : -mad_k_extreme * mad_scaled
+
+// E. Hurst Regime Classifier
+hurst = f_hurst(close, hurst_max, hurst_exps, hurst_min_scales)
+is_trend = not na(hurst) and hurst > hurst_trend
+is_revert = not na(hurst) and hurst < hurst_revert
+is_transition = not na(hurst) and hurst >= hurst_revert and hurst <= hurst_trend
+
+// ====================================================
+// ============== DIVERGENCE DETECTION ================
+// ====================================================
+
+// Find pivots
+ph_cyber = is_pivot_high(cyber_sm, div_lookback, div_lookback)
+pl_cyber = is_pivot_low(cyber_sm, div_lookback, div_lookback)
+ph_rsx = is_pivot_high(rsx_osc, div_lookback, div_lookback)
+pl_rsx = is_pivot_low(rsx_osc, div_lookback, div_lookback)
+ph_price = is_pivot_high(close, div_lookback, div_lookback)
+pl_price = is_pivot_low(close, div_lookback, div_lookback)
+
+// Store pivot values
+var float last_high_price = na
+var float last_high_cyber = na
+var float last_high_rsx = na
+var float last_low_price = na
+var float last_low_cyber = na
+var float last_low_rsx = na
+
+if ph_price
+    last_high_price := close
+if ph_cyber
+    last_high_cyber := cyber_sm
+if ph_rsx
+    last_high_rsx := rsx_osc
+
+if pl_price
+    last_low_price := close
+if pl_cyber
+    last_low_cyber := cyber_sm
+if pl_rsx
+    last_low_rsx := rsx_osc
+
+// Bullish Divergence Detection
+bull_div_cyber = pl_price and pl_cyber and not na(last_low_price) and not na(last_low_cyber) and close < last_low_price and cyber_sm > last_low_cyber
+bull_div_rsx = pl_price and pl_rsx and not na(last_low_price) and not na(last_low_rsx) and close < last_low_price and rsx_osc > last_low_rsx
+bull_div_jcma = pl_price and not na(last_low_price) and close < last_low_price and jcma_slope_pos
+
+// Bearish Divergence Detection
+bear_div_cyber = ph_price and ph_cyber and not na(last_high_price) and not na(last_high_cyber) and close > last_high_price and cyber_sm < last_high_cyber
+bear_div_rsx = ph_price and ph_rsx and not na(last_high_price) and not na(last_high_rsx) and close > last_high_price and rsx_osc < last_high_rsx
+bear_div_jcma = ph_price and not na(last_high_price) and close > last_high_price and not jcma_slope_pos
+
+// Divergence Scoring
+bull_div_score = (bull_div_cyber ? 1 : 0) + (bull_div_rsx ? 1 : 0) + (bull_div_jcma ? 1 : 0)
+bear_div_score = (bear_div_cyber ? 1 : 0) + (bear_div_rsx ? 1 : 0) + (bear_div_jcma ? 1 : 0)
+
+// Strong divergence signals
+strong_bull_div = bull_div_score >= div_threshold
+strong_bear_div = bear_div_score >= div_threshold
+
+// ====================================================
+// ================ SIGNAL GENERATION =================
+// ====================================================
+
+// Buy Conditions
+buy_condition = is_revert and cyber_sm < lower_entry and jcma_slope_pos and strong_bull_div
+buy_signal = show_signals and buy_condition
+
+// Sell Conditions
+sell_condition = is_revert and cyber_sm > upper_entry and not jcma_slope_pos and strong_bear_div
+sell_signal = show_signals and sell_condition
+
+// Reversal Layer Colors
+reversal_color = strong_bull_div ? color.new(color.green, 70) : 
+                 strong_bear_div ? color.new(color.red, 70) : 
+                 is_transition ? color.new(color.yellow, 85) : 
+                 color.new(color.gray, 90)
+
+// ====================================================
+// =================== PLOTTING =======================
+// ====================================================
+
+// Cyber Cycle Oscillator (colored by regime)
+osc_color = is_trend ? color.orange : is_revert ? color.teal : color.gray
+plot(cyber_sm, title="Cyber Cycle", color=osc_color, linewidth=2)
+hline(0, "Zero", color=color.new(color.gray, 60))
+
+// RSX Oscillator
+plot(show_rsx ? rsx_osc : na, title="RSX", color=color.new(color.purple, 30), linewidth=1)
+
+// MAD Bands
+plot(show_mad_bands ? upper_entry : na, title="Upper Entry", color=color.new(color.red, 70), linewidth=1)
+plot(show_mad_bands ? lower_entry : na, title="Lower Entry", color=color.new(color.green, 70), linewidth=1)
+plot(show_mad_bands ? upper_ext : na, title="Upper Extreme", color=color.new(color.red, 85), style=plot.style_circles)
+plot(show_mad_bands ? lower_ext : na, title="Lower Extreme", color=color.new(color.green, 85), style=plot.style_circles)
+
+// Hurst Line
+plot(show_hurst ? hurst : na, title="Hurst", color=color.fuchsia, linewidth=1)
+hline(hurst_trend, "Trend Thresh", color=color.new(color.green, 80), linestyle=hline.style_dotted)
+hline(hurst_revert, "Revert Thresh", color=color.new(color.red, 80), linestyle=hline.style_dotted)
+
+// Regime Background
+bgcolor(show_regime_bg ? (is_trend ? color.new(color.orange, 92) : is_revert ? color.new(color.teal, 92) : color.new(color.gray, 95)) : na, title="Regime BG")
+
+// Reversal Layer Background
+bgcolor(show_divergence ? reversal_color : na, title="Reversal Layer")
+
+// Entry Signals
+plotshape(buy_signal, title="BUY", location=location.belowbar, color=color.green, style=shape.labelup, text="BUY", size=size.small)
+plotshape(sell_signal, title="SELL", location=location.abovebar, color=color.red, style=shape.labeldown, text="SELL", size=size.small)
+
+// Divergence Markers
+plotchar(show_divergence and strong_bull_div, title="Bull Div", char="▲", location=location.belowbar, color=color.lime, size=size.tiny)
+plotchar(show_divergence and strong_bear_div, title="Bear Div", char="▼", location=location.abovebar, color=color.red, size=size.tiny)
+
+// Diagnostics Label
+var label diag = na
+if show_diagnostics and barstate.islast
+    if not na(diag)
+        label.delete(diag)
+    regime_txt = is_trend ? "TREND" : is_revert ? "REVERT" : "TRANSITION"
+    div_txt = "Bull:" + str.tostring(bull_div_score) + " Bear:" + str.tostring(bear_div_score)
+    diag := label.new(bar_index, cyber_sm, 
+         "Regime: " + regime_txt + "\n" +
+         "Hurst: " + (not na(hurst) ? str.tostring(hurst, "#.000") : "na") + "\n" +
+         "MAD: " + (not na(mad_scaled) ? str.tostring(mad_scaled, "#.000") : "na") + "\n" +
+         "Div: " + div_txt,
+         style=label.style_label_left, 
+         color=color.new(color.black, 85), 
+         textcolor=color.white, 
+         size=size.small)

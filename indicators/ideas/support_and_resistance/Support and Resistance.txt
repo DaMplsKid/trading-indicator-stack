@@ -1,0 +1,689 @@
+//@version=5
+indicator("Next-Gen S/R Zones + ORB + Sessions", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+// ============================================================================
+// INPUTS - S/R ZONES
+// ============================================================================
+zoneSensitivity = input.int(3, "Zone Detection Sensitivity", minval=1, maxval=10, tooltip="Lower = fewer, stronger zones. Higher = more zones detected", group="S/R Zones")
+lookbackBars = input.int(100, "Lookback Period", minval=20, maxval=500, group="S/R Zones")
+zoneWidth = input.float(0.15, "Zone Width %", minval=0.05, maxval=1.0, step=0.05, group="S/R Zones")
+minTouches = input.int(2, "Minimum Touches", minval=2, maxval=5, group="S/R Zones")
+showWeakZones = input.bool(true, "Show Weak Zones", group="S/R Zones")
+useVolume = input.bool(true, "Use Volume Weighting", tooltip="Gives more weight to levels with high volume", group="S/R Zones")
+maxZones = input.int(4, "Max Zones to Display", minval=3, maxval=15, group="S/R Zones")
+
+// Multi-timeframe inputs
+useMTF = input.bool(true, "Multi-Timeframe Analysis", group="S/R Zones")
+mtf1 = input.timeframe("15", "Higher TF 1", group="S/R Zones")
+mtf2 = input.timeframe("60", "Higher TF 2", group="S/R Zones")
+
+// ============================================================================
+// INPUTS - OPENING RANGE BREAKOUT
+// ============================================================================
+enableORB = input.bool(true, "Enable Opening Range Breakout", group="Opening Range")
+orbMinutes = input.int(10, "Opening Range Minutes", minval=5, maxval=120, step=5, group="Opening Range")
+showORBTargets = input.bool(true, "Show ORB Targets", group="Opening Range")
+orbTargetMultiplier = input.float(1.0, "ORB Target Multiplier", minval=0.5, maxval=3.0, step=0.5, group="Opening Range")
+showPrevDayHL = input.bool(true, "Show Previous Day High/Low", group="Opening Range")
+
+// ============================================================================
+// INPUTS - SESSION MANAGEMENT
+// ============================================================================
+enableSessions = input.bool(true, "Enable Session Identification", group="Sessions")
+showSessionBG = input.bool(true, "Show Session Backgrounds", group="Sessions")
+showSessionLines = input.bool(true, "Show Session Dividers", group="Sessions")
+avoidLunchChop = input.bool(true, "Reduce Sensitivity During Lunch", group="Sessions")
+
+// Session times (Eastern Time)
+preMarketStart = input.int(4, "Pre-Market Start Hour", minval=0, maxval=23, group="Sessions")
+marketOpen = input.int(930, "Market Open (HHMM)", minval=0, maxval=2359, group="Sessions")
+lunchStart = input.int(1130, "Lunch Start (HHMM)", minval=0, maxval=2359, group="Sessions")
+pmStart = input.int(1400, "PM Session Start (HHMM)", minval=0, maxval=2359, group="Sessions")
+marketClose = input.int(1600, "Market Close (HHMM)", minval=0, maxval=2359, group="Sessions")
+
+// ============================================================================
+// INPUTS - RANGE DETECTOR
+// ============================================================================
+enableRange = input.bool(true, "Enable Range Detector", group="Range Detector")
+rangeLength = input.int(10, 'Minimum Range Length', minval = 2, group="Range Detector")
+rangeMult = input.float(1., 'Range Width Multiplier', minval = 0, step = 0.1, group="Range Detector")
+rangeATRLen = input.int(500, 'Range ATR Length', minval = 1, group="Range Detector")
+showRangePlots = input.bool(true, "Show Range Lines", group="Range Detector")
+
+// ============================================================================
+// INPUTS - LINEAR REGRESSION CHANNEL
+// ============================================================================
+enableLRC = input.bool(false, "Enable Linear Regression Channel", group="Linear Regression")
+lrcLength = input.int(50, "Channel Length", minval=10, group="Linear Regression")
+lrcDeviation = input.float(1.0, "Channel Deviation", minval=0.1, step=0.1, group="Linear Regression")
+enableLRCFuture = input.bool(true, "Show Future Projection", group="Linear Regression")
+lrcFutureLength = input.int(50, "Future Projection Length", minval=10, group="Linear Regression")
+lrcFutureDeviation = input.float(1.0, "Future Projection Deviation", minval=0.1, step=0.1, group="Linear Regression")
+showLRCArrow = input.bool(true, "Show Trend Arrow", group="Linear Regression")
+
+// ============================================================================
+// INPUTS - VISUAL SETTINGS
+// ============================================================================
+colorStrong = input.color(color.new(#00ff00, 70), "Strong Support", group="Colors")
+colorMedium = input.color(color.new(#ffff00, 75), "Medium Support", group="Colors")
+colorWeak = input.color(color.new(#ff6600, 80), "Weak Support", group="Colors")
+colorResistStrong = input.color(color.new(#ff0000, 70), "Strong Resistance", group="Colors")
+colorResistMedium = input.color(color.new(#ff00ff, 75), "Medium Resistance", group="Colors")
+colorResistWeak = input.color(color.new(#ff9999, 80), "Weak Resistance", group="Colors")
+
+colorORB = input.color(color.new(#00bfff, 50), "ORB Zone Color", group="Colors")
+colorPreMarket = input.color(color.new(#1a1a2e, 92), "Pre-Market BG", group="Colors")
+colorAMSession = input.color(color.new(#16213e, 95), "AM Session BG", group="Colors")
+colorLunch = input.color(color.new(#533483, 95), "Lunch BG", group="Colors")
+colorPM = input.color(color.new(#0f3460, 95), "PM Session BG", group="Colors")
+colorAfterHours = input.color(color.new(#1a1a2e, 92), "After Hours BG", group="Colors")
+
+// Range Detector Colors
+colorRangeUp = input.color(#089981, 'Range Broken Upward', group="Colors")
+colorRangeDown = input.color(#f23645, 'Range Broken Downward', group="Colors")
+colorRangeUnbroken = input.color(#2157f3, 'Range Unbroken', group="Colors")
+
+// Linear Regression Colors
+colorLRCUp = input.color(color.aqua, 'LRC Upper Band', group="Colors")
+colorLRCDown = input.color(#f01313, 'LRC Lower Band', group="Colors")
+colorLRCMid = input.color(color.yellow, 'LRC Midline', group="Colors")
+
+showLabels = input.bool(true, "Show Strength Labels", group="Display")
+showBreakoutAlert = input.bool(true, "Show Breakout Probability", group="Display")
+
+// ============================================================================
+// SESSION DETECTION FUNCTIONS
+// ============================================================================
+
+// Convert HHMM to minutes since midnight
+hhmm_to_minutes(hhmm) =>
+    hours = math.floor(hhmm / 100)
+    minutes = hhmm % 100
+    hours * 60 + minutes
+
+// Get current time in minutes since midnight (EST)
+getCurrentTimeMinutes() =>
+    hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+
+// Session identification
+marketOpenMin = hhmm_to_minutes(marketOpen)
+lunchStartMin = hhmm_to_minutes(lunchStart)
+pmStartMin = hhmm_to_minutes(pmStart)
+marketCloseMin = hhmm_to_minutes(marketClose)
+
+currentTimeMin = getCurrentTimeMinutes()
+
+isPreMarket = currentTimeMin < marketOpenMin
+isAMSession = currentTimeMin >= marketOpenMin and currentTimeMin < lunchStartMin
+isLunchSession = currentTimeMin >= lunchStartMin and currentTimeMin < pmStartMin
+isPMSession = currentTimeMin >= pmStartMin and currentTimeMin < marketCloseMin
+isAfterHours = currentTimeMin >= marketCloseMin
+
+// Session weight for zone strength (high volume sessions = higher weight)
+sessionWeight = isAMSession or isPMSession ? 1.3 : isLunchSession ? 0.7 : 1.0
+
+// ============================================================================
+// OPENING RANGE CALCULATION
+// ============================================================================
+
+var float orbHigh = na
+var float orbLow = na
+var float orbRange = na
+var bool orbCalculated = false
+var float prevDayHigh = na
+var float prevDayLow = na
+var bool inOpeningRange = false
+
+// Reset ORB at market open
+if enableORB and ta.change(time("D"))
+    orbHigh := na
+    orbLow := na
+    orbCalculated := false
+    prevDayHigh := high[1]
+    prevDayLow := low[1]
+
+// Calculate opening range
+if enableORB and isAMSession and not orbCalculated
+    minutesSinceOpen = (currentTimeMin - marketOpenMin)
+    
+    if minutesSinceOpen <= orbMinutes
+        inOpeningRange := true
+        if na(orbHigh) or high > orbHigh
+            orbHigh := high
+        if na(orbLow) or low < orbLow
+            orbLow := low
+    else
+        orbCalculated := true
+        inOpeningRange := false
+        orbRange := orbHigh - orbLow
+
+// ORB Breakout detection
+orbBullBreakout = enableORB and orbCalculated and ta.crossover(close, orbHigh)
+orbBearBreakout = enableORB and orbCalculated and ta.crossunder(close, orbLow)
+
+// ORB Targets
+orbBullTarget = orbHigh + (orbRange * orbTargetMultiplier)
+orbBearTarget = orbLow - (orbRange * orbTargetMultiplier)
+
+// ============================================================================
+// SESSION VISUALIZATION
+// ============================================================================
+
+var line sessionLine = na
+if enableSessions and showSessionLines
+    if ta.change(isAMSession) or ta.change(isLunchSession) or ta.change(isPMSession)
+        sessionLine := line.new(bar_index, low, bar_index, high, color=color.new(color.gray, 60), style=line.style_dashed, width=1)
+
+// Session backgrounds
+bgcolor(enableSessions and showSessionBG and isPreMarket ? colorPreMarket : na, title="Pre-Market")
+bgcolor(enableSessions and showSessionBG and isAMSession ? colorAMSession : na, title="AM Session")
+bgcolor(enableSessions and showSessionBG and isLunchSession ? colorLunch : na, title="Lunch")
+bgcolor(enableSessions and showSessionBG and isPMSession ? colorPM : na, title="PM Session")
+bgcolor(enableSessions and showSessionBG and isAfterHours ? colorAfterHours : na, title="After Hours")
+
+// Highlight opening range period
+bgcolor(enableORB and inOpeningRange ? color.new(#ffeb3b, 90) : na, title="Opening Range Period")
+
+// ============================================================================
+// RANGE DETECTOR
+// ============================================================================
+
+var box rangeBx = na
+var line rangeLvl = na
+var float rangeMax = na
+var float rangeMin = na
+var int rangeOS = 0
+color rangeDetectCss = na
+
+if enableRange
+    n = bar_index
+    rangeATR = ta.atr(rangeATRLen) * rangeMult
+    rangeMA = ta.sma(close, rangeLength)
+    
+    rangeCount = 0
+    for i = 0 to rangeLength - 1
+        rangeCount += math.abs(close[i] - rangeMA) > rangeATR ? 1 : 0
+    
+    // Range detected
+    if rangeCount == 0 and rangeCount[1] != rangeCount
+        // Test for overlap and change coordinates
+        if not na(rangeBx) and n[rangeLength] <= rangeBx.get_right()
+            rangeMax := math.max(rangeMA + rangeATR, rangeBx.get_top())
+            rangeMin := math.min(rangeMA - rangeATR, rangeBx.get_bottom())
+            
+            // Box new coordinates
+            rangeBx.set_top(rangeMax)
+            rangeBx.set_rightbottom(n, rangeMin)
+            rangeBx.set_bgcolor(color.new(colorRangeUnbroken, 80))
+            
+            // Line new coordinates
+            rangeAvg = math.avg(rangeMax, rangeMin)
+            rangeLvl.set_y1(rangeAvg)
+            rangeLvl.set_xy2(n, rangeAvg)
+            rangeLvl.set_color(colorRangeUnbroken)
+        else
+            rangeMax := rangeMA + rangeATR
+            rangeMin := rangeMA - rangeATR
+            
+            // Set new box and level
+            rangeBx := box.new(n[rangeLength], rangeMA + rangeATR, n, rangeMA - rangeATR, na, bgcolor = color.new(colorRangeUnbroken, 80))
+            
+            rangeLvl := line.new(n[rangeLength], rangeMA, n, rangeMA, color = colorRangeUnbroken, style = line.style_dotted)
+            
+            rangeDetectCss := color.new(color.gray, 80)
+            rangeOS := 0
+    
+    else if rangeCount == 0 and not na(rangeBx)
+        rangeBx.set_right(n)
+        rangeLvl.set_x2(n)
+    
+    // Set color based on breakout
+    if not na(rangeBx)
+        if close > rangeBx.get_top()
+            rangeBx.set_bgcolor(color.new(colorRangeUp, 80))
+            rangeLvl.set_color(colorRangeUp)
+            rangeOS := 1
+        else if close < rangeBx.get_bottom()
+            rangeBx.set_bgcolor(color.new(colorRangeDown, 80))
+            rangeLvl.set_color(colorRangeDown)
+            rangeOS := -1
+
+// Range detection bgcolor
+bgcolor(enableRange ? rangeDetectCss : na, title="Range Detection")
+
+// ============================================================================
+// LINEAR REGRESSION CHANNEL
+// ============================================================================
+
+var line[] lrcLines = array.new_line(3)
+var line[] lrcFutureLines = array.new_line(3)
+
+// Linear regression calculation function
+linearRegression(src, length) =>
+    sumX = 0.0
+    sumY = 0.0
+    sumXY = 0.0
+    sumXSq = 0.0
+    
+    for i = 0 to length - 1
+        sumX += i + 1
+        sumY += src[i]
+        sumXY += (i + 1) * src[i]
+        sumXSq += math.pow(i + 1, 2)
+    
+    slope = (length * sumXY - sumX * sumY) / (length * sumXSq - math.pow(sumX, 2))
+    intercept = (sumY - slope * sumX) / length
+    
+    y1 = intercept + slope * (length - 1)
+    
+    dev = 0.0
+    for i = 0 to length - 1
+        dev := dev + math.pow(src[i] - (slope * (length - i) + intercept), 2)
+    dev := math.sqrt(dev / length)
+    
+    [intercept, y1, dev, slope]
+
+if enableLRC
+    // Calculate linear regression for main channel
+    [y2, y1, dev, slope] = linearRegression(close, lrcLength)
+    
+    // Current channel lines
+    if barstate.islast
+        // Clear old lines
+        for ln in lrcLines
+            line.delete(ln)
+        array.clear(lrcLines)
+        
+        // Draw channel lines
+        for i = 0 to 2
+            yStart = y1 + dev * lrcDeviation * (i - 1)
+            yEnd = y2 + dev * lrcDeviation * (i - 1)
+            
+            newLine = line.new(x1 = bar_index - (lrcLength - 1), y1 = yStart, x2 = bar_index, y2 = yEnd, color = color.gray, style = i % 2 == 1 ? line.style_dashed : line.style_solid, width = 2, extend = extend.none)
+            array.push(lrcLines, newLine)
+        
+        // Fill channel
+        if array.size(lrcLines) == 3
+            linefill.new(array.get(lrcLines, 1), array.get(lrcLines, 2), color.new(colorLRCUp, 90))
+            linefill.new(array.get(lrcLines, 1), array.get(lrcLines, 0), color.new(colorLRCDown, 90))
+    
+    // Future projection
+    if enableLRCFuture and barstate.islast
+        [y2f, y1f, devf, slopef] = linearRegression(close, lrcFutureLength)
+        
+        // Clear old future lines
+        for ln in lrcFutureLines
+            line.delete(ln)
+        array.clear(lrcFutureLines)
+        
+        // Draw future projection lines
+        for i = 0 to 2
+            yStart = y1f + devf * lrcFutureDeviation * (i - 1)
+            yEnd = y2f + devf * lrcFutureDeviation * (i - 1)
+            
+            newLine = line.new(x1 = bar_index - (lrcFutureLength - 1), y1 = yStart, x2 = bar_index, y2 = yEnd, color = color.gray, style = i % 2 == 1 ? line.style_dotted : line.style_dashed, width = 1, extend = extend.right)
+            array.push(lrcFutureLines, newLine)
+        
+        // Fill future projection
+        if array.size(lrcFutureLines) == 3
+            linefill.new(array.get(lrcFutureLines, 1), array.get(lrcFutureLines, 2), color.new(colorLRCUp, 95))
+            linefill.new(array.get(lrcFutureLines, 1), array.get(lrcFutureLines, 0), color.new(colorLRCDown, 95))
+        
+        // Trend arrow
+        if showLRCArrow
+            arrowText = hl2 > y2f ? "⇗" : hl2 < y2f ? "⇘" : "⇒"
+            arrowColor = hl2 > y2f ? colorLRCUp : hl2 < y2f ? colorLRCDown : color.gray
+            
+            trendLabel = label.new(x = bar_index, y = hl2 > y2f ? high : low, text = arrowText, textcolor = arrowColor, color = color(na), size = size.huge, style = label.style_label_left)
+
+// ============================================================================
+// S/R ZONE FUNCTIONS
+// ============================================================================
+
+pivotHigh = ta.pivothigh(high, zoneSensitivity, zoneSensitivity)
+pivotLow = ta.pivotlow(low, zoneSensitivity, zoneSensitivity)
+
+// Volume calculation
+avgVolume = ta.sma(volume, 20)
+volumeWeight = useVolume ? (volume / avgVolume) : 1.0
+
+// ============================================================================
+// ZONE STORAGE
+// ============================================================================
+
+type Zone
+    float level
+    int touches
+    float volumeWeight
+    int barsAgo
+    bool isResistance
+    float strength
+    int mtfConfluence
+    bool broken
+    string session
+
+var array<Zone> supportZones = array.new<Zone>()
+var array<Zone> resistanceZones = array.new<Zone>()
+
+// ============================================================================
+// ZONE STRENGTH CALCULATION
+// ============================================================================
+
+calcStrength(touches, volWeight, barsAgo, mtfConf, sess) =>
+    touchScore = math.min(touches / 5.0, 1.0) * 0.25
+    volScore = math.min(volWeight / 2.0, 1.0) * 0.20
+    recencyScore = math.max(0, 1.0 - (barsAgo / lookbackBars)) * 0.20
+    mtfScore = (mtfConf / 2.0) * 0.20
+    
+    // Session bonus: AM and PM sessions get higher weight
+    sessionBonus = (sess == "AM" or sess == "PM") ? 0.15 : sess == "LUNCH" ? 0.0 : 0.08
+    
+    touchScore + volScore + recencyScore + mtfScore + sessionBonus
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+isNearLevel(price, level, widthPct) =>
+    math.abs(price - level) / level <= (widthPct / 100.0)
+
+getSession() =>
+    isAMSession ? "AM" : isLunchSession ? "LUNCH" : isPMSession ? "PM" : isPreMarket ? "PRE" : "AH"
+
+addOrUpdateZone(zones, level, isRes, volWeight, mtfConf, sess) =>
+    found = false
+    zoneWidthPct = avoidLunchChop and sess == "LUNCH" ? zoneWidth * 1.5 : zoneWidth
+    
+    // Only loop if array has elements
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            z = array.get(zones, i)
+            if isNearLevel(level, z.level, zoneWidthPct)
+                z.touches += 1
+                z.volumeWeight := (z.volumeWeight + volWeight) / 2
+                z.barsAgo := 0
+                z.mtfConfluence := math.max(z.mtfConfluence, mtfConf)
+                z.strength := calcStrength(z.touches, z.volumeWeight, z.barsAgo, z.mtfConfluence, z.session)
+                array.set(zones, i, z)
+                found := true
+                break
+    
+    // Add new zone if not found and under limit
+    if not found and array.size(zones) < 50
+        newZone = Zone.new(level, 1, volWeight, 0, isRes, 0.0, mtfConf, false, sess)
+        newZone.strength := calcStrength(1, volWeight, 0, mtfConf, sess)
+        array.push(zones, newZone)
+    found
+
+// ============================================================================
+// MULTI-TIMEFRAME DATA (must be called outside conditionals)
+// ============================================================================
+
+htf1High = useMTF ? request.security(syminfo.tickerid, mtf1, high[zoneSensitivity], barmerge.gaps_off, barmerge.lookahead_on) : na
+htf2High = useMTF ? request.security(syminfo.tickerid, mtf2, high[zoneSensitivity], barmerge.gaps_off, barmerge.lookahead_on) : na
+htf1Low = useMTF ? request.security(syminfo.tickerid, mtf1, low[zoneSensitivity], barmerge.gaps_off, barmerge.lookahead_on) : na
+htf2Low = useMTF ? request.security(syminfo.tickerid, mtf2, low[zoneSensitivity], barmerge.gaps_off, barmerge.lookahead_on) : na
+
+// ============================================================================
+// DETECT NEW ZONES
+// ============================================================================
+
+currentSession = getSession()
+
+if not na(pivotHigh)
+    mtfConfluence = 0
+    
+    if useMTF
+        if not na(htf1High) and isNearLevel(pivotHigh, htf1High, zoneWidth * 2)
+            mtfConfluence += 1
+        if not na(htf2High) and isNearLevel(pivotHigh, htf2High, zoneWidth * 2)
+            mtfConfluence += 1
+    
+    addOrUpdateZone(resistanceZones, pivotHigh, true, volumeWeight[zoneSensitivity] * sessionWeight, mtfConfluence, currentSession)
+
+if not na(pivotLow)
+    mtfConfluence = 0
+    
+    if useMTF
+        if not na(htf1Low) and isNearLevel(pivotLow, htf1Low, zoneWidth * 2)
+            mtfConfluence += 1
+        if not na(htf2Low) and isNearLevel(pivotLow, htf2Low, zoneWidth * 2)
+            mtfConfluence += 1
+    
+    addOrUpdateZone(supportZones, pivotLow, false, volumeWeight[zoneSensitivity] * sessionWeight, mtfConfluence, currentSession)
+
+// ============================================================================
+// ADD ORB LEVELS AS ZONES
+// ============================================================================
+
+if enableORB and orbCalculated and not na(orbHigh)
+    addOrUpdateZone(resistanceZones, orbHigh, true, 1.5, 2, "ORB")
+    addOrUpdateZone(supportZones, orbLow, false, 1.5, 2, "ORB")
+
+// Add previous day high/low
+if showPrevDayHL and not na(prevDayHigh)
+    addOrUpdateZone(resistanceZones, prevDayHigh, true, 1.3, 1, "PDH")
+    addOrUpdateZone(supportZones, prevDayLow, false, 1.3, 1, "PDL")
+
+// ============================================================================
+// UPDATE ZONES
+// ============================================================================
+
+if array.size(supportZones) > 0
+    for i = array.size(supportZones) - 1 to 0
+        z = array.get(supportZones, i)
+        z.barsAgo += 1
+        
+        if isNearLevel(low, z.level, zoneWidth)
+            z.touches += 1
+            z.barsAgo := 0
+            z.volumeWeight := (z.volumeWeight + volumeWeight) / 2
+        
+        if close < z.level * (1 - zoneWidth / 100)
+            z.broken := true
+        
+        z.strength := calcStrength(z.touches, z.volumeWeight, z.barsAgo, z.mtfConfluence, z.session)
+        
+        if z.barsAgo > lookbackBars or (z.strength < 0.3 and not showWeakZones) or z.broken
+            array.remove(supportZones, i)
+        else
+            array.set(supportZones, i, z)
+
+if array.size(resistanceZones) > 0
+    for i = array.size(resistanceZones) - 1 to 0
+        z = array.get(resistanceZones, i)
+        z.barsAgo += 1
+        
+        if isNearLevel(high, z.level, zoneWidth)
+            z.touches += 1
+            z.barsAgo := 0
+            z.volumeWeight := (z.volumeWeight + volumeWeight) / 2
+        
+        if close > z.level * (1 + zoneWidth / 100)
+            z.broken := true
+        
+        z.strength := calcStrength(z.touches, z.volumeWeight, z.barsAgo, z.mtfConfluence, z.session)
+        
+        if z.barsAgo > lookbackBars or (z.strength < 0.3 and not showWeakZones) or z.broken
+            array.remove(resistanceZones, i)
+        else
+            array.set(resistanceZones, i, z)
+
+// ============================================================================
+// SORT AND LIMIT ZONES
+// ============================================================================
+
+if array.size(supportZones) > 1
+    for i = 0 to array.size(supportZones) - 2
+        for j = i + 1 to array.size(supportZones) - 1
+            if array.get(supportZones, j).strength > array.get(supportZones, i).strength
+                temp = array.get(supportZones, i)
+                array.set(supportZones, i, array.get(supportZones, j))
+                array.set(supportZones, j, temp)
+
+if array.size(resistanceZones) > 1
+    for i = 0 to array.size(resistanceZones) - 2
+        for j = i + 1 to array.size(resistanceZones) - 1
+            if array.get(resistanceZones, j).strength > array.get(resistanceZones, i).strength
+                temp = array.get(resistanceZones, i)
+                array.set(resistanceZones, i, array.get(resistanceZones, j))
+                array.set(resistanceZones, j, temp)
+
+if array.size(supportZones) > maxZones
+    while array.size(supportZones) > maxZones
+        array.pop(supportZones)
+    
+if array.size(resistanceZones) > maxZones
+    while array.size(resistanceZones) > maxZones
+        array.pop(resistanceZones)
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+var box[] supportBoxes = array.new_box()
+var box[] resistBoxes = array.new_box()
+var label[] supportLabels = array.new_label()
+var label[] resistLabels = array.new_label()
+var line[] orbLines = array.new_line()
+
+// Clear old visuals
+for b in supportBoxes
+    box.delete(b)
+for b in resistBoxes
+    box.delete(b)
+for l in supportLabels
+    label.delete(l)
+for l in resistLabels
+    label.delete(l)
+for ln in orbLines
+    line.delete(ln)
+
+array.clear(supportBoxes)
+array.clear(resistBoxes)
+array.clear(supportLabels)
+array.clear(resistLabels)
+array.clear(orbLines)
+
+// Draw support zones
+if array.size(supportZones) > 0
+    for i = 0 to array.size(supportZones) - 1
+        z = array.get(supportZones, i)
+        
+        if z.touches >= minTouches
+            zoneTop = z.level * (1 + zoneWidth / 100)
+            zoneBottom = z.level * (1 - zoneWidth / 100)
+            
+            boxColor = z.session == "ORB" or z.session == "PDL" ? colorORB : 
+                       z.strength > 0.7 ? colorStrong : 
+                       z.strength > 0.4 ? colorMedium : colorWeak
+            
+            b = box.new(bar_index - 10, zoneTop, bar_index + 50, zoneBottom, 
+                         border_color=na, bgcolor=boxColor)
+            array.push(supportBoxes, b)
+            
+            if showLabels
+                strengthPct = str.tostring(math.round(z.strength * 100))
+                sessionLabel = z.session == "ORB" ? "ORB-L " : z.session == "PDL" ? "PDL " : ""
+                labelText = sessionLabel + "S: " + strengthPct + "%"
+                
+                if showBreakoutAlert and z.touches > 3
+                    breakoutProb = math.min(z.touches * 15, 85)
+                    labelText += "\n⚠ " + str.tostring(breakoutProb) + "%"
+                
+                l = label.new(bar_index, z.level, labelText, 
+                             style=label.style_label_right, 
+                             color=z.session == "ORB" ? color.new(#00bfff, 20) : color.new(color.green, 30),
+                             textcolor=color.white, size=size.small)
+                array.push(supportLabels, l)
+
+// Draw resistance zones
+if array.size(resistanceZones) > 0
+    for i = 0 to array.size(resistanceZones) - 1
+        z = array.get(resistanceZones, i)
+        
+        if z.touches >= minTouches
+            zoneTop = z.level * (1 + zoneWidth / 100)
+            zoneBottom = z.level * (1 - zoneWidth / 100)
+            
+            boxColor = z.session == "ORB" or z.session == "PDH" ? colorORB : 
+                       z.strength > 0.7 ? colorResistStrong : 
+                       z.strength > 0.4 ? colorResistMedium : colorResistWeak
+            
+            b = box.new(bar_index - 10, zoneTop, bar_index + 50, zoneBottom, 
+                         border_color=na, bgcolor=boxColor)
+            array.push(resistBoxes, b)
+            
+            if showLabels
+                strengthPct = str.tostring(math.round(z.strength * 100))
+                sessionLabel = z.session == "ORB" ? "ORB-H " : z.session == "PDH" ? "PDH " : ""
+                labelText = sessionLabel + "R: " + strengthPct + "%"
+                
+                if showBreakoutAlert and z.touches > 3
+                    breakoutProb = math.min(z.touches * 15, 85)
+                    labelText += "\n⚠ " + str.tostring(breakoutProb) + "%"
+                
+                l = label.new(bar_index, z.level, labelText, 
+                             style=label.style_label_right, 
+                             color=z.session == "ORB" ? color.new(#00bfff, 20) : color.new(color.red, 30),
+                             textcolor=color.white, size=size.small)
+                array.push(resistLabels, l)
+
+// Draw ORB targets
+if enableORB and orbCalculated and showORBTargets and not na(orbBullTarget)
+    targetLine1 = line.new(bar_index - 20, orbBullTarget, bar_index + 30, orbBullTarget,
+                           color=color.new(#00ff00, 40), style=line.style_dashed, width=2)
+    targetLine2 = line.new(bar_index - 20, orbBearTarget, bar_index + 30, orbBearTarget,
+                           color=color.new(#ff0000, 40), style=line.style_dashed, width=2)
+    array.push(orbLines, targetLine1)
+    array.push(orbLines, targetLine2)
+    
+    targetLabel1 = label.new(bar_index, orbBullTarget, "ORB Target ↑", 
+                             style=label.style_label_down, color=color.new(#00ff00, 30),
+                             textcolor=color.white, size=size.tiny)
+    targetLabel2 = label.new(bar_index, orbBearTarget, "ORB Target ↓", 
+                             style=label.style_label_up, color=color.new(#ff0000, 30),
+                             textcolor=color.white, size=size.tiny)
+    array.push(supportLabels, targetLabel1)
+    array.push(supportLabels, targetLabel2)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+nearStrongSupport = false
+nearStrongResistance = false
+
+if array.size(supportZones) > 0
+    for i = 0 to math.min(2, array.size(supportZones) - 1)
+        z = array.get(supportZones, i)
+        if z.strength > 0.6 and isNearLevel(close, z.level, zoneWidth * 1.5)
+            nearStrongSupport := true
+
+if array.size(resistanceZones) > 0
+    for i = 0 to math.min(2, array.size(resistanceZones) - 1)
+        z = array.get(resistanceZones, i)
+        if z.strength > 0.6 and isNearLevel(close, z.level, zoneWidth * 1.5)
+            nearStrongResistance := true
+
+alertcondition(nearStrongSupport, "Approaching Strong Support", "Price nearing high-probability support zone")
+alertcondition(nearStrongResistance, "Approaching Strong Resistance", "Price nearing high-probability resistance zone")
+alertcondition(orbBullBreakout, "ORB Bull Breakout", "Price broke above opening range high!")
+alertcondition(orbBearBreakout, "ORB Bear Breakout", "Price broke below opening range low!")
+alertcondition(isAMSession and ta.change(isAMSession), "AM Session Started", "Market open - AM session begins")
+alertcondition(isPMSession and ta.change(isPMSession), "PM Session Started", "PM session begins - power hour ahead")
+
+// Plots for data window
+plot(nearStrongSupport ? 1 : 0, "Near Strong Support", display=display.data_window)
+plot(nearStrongResistance ? 1 : 0, "Near Strong Resistance", display=display.data_window)
+plot(orbBullBreakout ? 1 : 0, "ORB Bull Break", display=display.data_window)
+plot(orbBearBreakout ? 1 : 0, "ORB Bear Break", display=display.data_window)
+
+// Plot ORB levels for reference
+plot(enableORB and orbCalculated ? orbHigh : na, "ORB High", color=#00bfff, linewidth=2, style=plot.style_linebr)
+plot(enableORB and orbCalculated ? orbLow : na, "ORB Low", color=#00bfff, linewidth=2, style=plot.style_linebr)
+
+// Range Detector Plots
+plot(enableRange and showRangePlots and rangeMax == rangeMax ? rangeMax : na, 'Range Top', rangeMax != rangeMax[1] ? na : rangeOS == 0 ? colorRangeUnbroken : rangeOS == 1 ? colorRangeUp : colorRangeDown, linewidth=2)
+
+plot(enableRange and showRangePlots and rangeMin == rangeMin ? rangeMin : na, 'Range Bottom', rangeMin != rangeMin[1] ? na : rangeOS == 0 ? colorRangeUnbroken : rangeOS == 1 ? colorRangeUp : colorRangeDown, linewidth=2)

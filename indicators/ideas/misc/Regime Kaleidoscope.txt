@@ -1,0 +1,245 @@
+//@version=5
+indicator("Regime Kaleidoscope", overlay=true, max_labels_count=200, max_lines_count=200)
+
+// ----------------- Inputs: features & thresholds -----------------
+featureLookback = input.int(75, "Feature Lookback", minval=20, maxval=200)
+atrLen = input.int(14, "ATR Length")
+atrMeanLen = input.int(50, "ATR mean length (for ATR floor)")
+lowVolPct = input.int(35, "Low Vol Percentile (%)", minval=1, maxval=99)
+highVolPct = input.int(65, "High Vol Percentile (%)", minval=1, maxval=99)
+bodyPctLow = input.int(35, "Body/Range Low Percentile (%)", minval=1, maxval=99)
+bodyPctHigh = input.int(65, "Body/Range High Percentile (%)", minval=1, maxval=99)
+
+// ----------------- Inputs: behavioral toggles -----------------
+enableMR = input.bool(true, "Enable Mean-Reversion Signals")
+enableBO = input.bool(true, "Enable Breakout Signals")
+barsForTransition = input.int(1, "Bars for Transition Confirmation", minval=1)
+signalCooldownBars = input.int(7, "Signal Cooldown Bars (per regime)", minval=0)
+enableTrendFilter = input.bool(true, "Enable HTF Trend Filter")
+trendTF = input.timeframe("D", "Trend HTF (empty = current TF)")
+trendLen = input.int(50, "Trend length (HTF SMA)")
+minATRpct = input.int(70, "Min ATR as % of ATR mean", minval=1, maxval=200)  // e.g. 70% = 0.7
+
+// ----------------- Inputs: confirmation & visuals -----------------
+mr_k = input.float(1.0, "MR distance (k * ATR)", step=0.1)
+pivotLeft = input.int(3, "Pivot left bars (for breakout)", minval=1)
+pivotRight = input.int(3, "Pivot right bars (for breakout)", minval=1)
+confirmCandleRequired = input.bool(true, "Require confirming candle for MR/BO")
+showTable = input.bool(false, "Show small info table (on transitions only)")
+
+// Visuals
+c_lowvol = input.color(color.new(color.green, 85), "LowVol Balanced (bg)")
+c_highvol = input.color(color.new(color.red, 85), "HighVol Directional (bg)")
+c_chop = input.color(color.new(color.gray, 90), "Chop (bg)")
+labelColor = input.color(color.white, "Label text color")
+small = 1e-9
+
+// ----------------- Feature calculations -----------------
+rng = high - low
+body = math.abs(close - open)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+bodyToRange = body / math.max(rng, small)
+wickSym = 1 - math.abs(upperWick - lowerWick) / math.max(rng, small)
+atr = ta.atr(atrLen)
+atr_mean = ta.sma(atr, atrMeanLen)
+atr_floor_ok = atr >= atr_mean * (minATRpct / 100.0)
+
+// rolling percentile helper (closed-bar values)
+f_percentile_from_series(_series, _len, _pct) =>
+    arr = array.new_float(0)
+    maxN = math.min(_len, bar_index + 1)
+    for i = 0 to maxN - 1
+        val = _series[i]
+        if not na(val)
+            array.push(arr, val)
+    if array.size(arr) == 0
+        na
+    else
+        array.sort(arr)
+        idx = math.floor((array.size(arr) - 1) * math.max(0.0, math.min(1.0, _pct / 100.0)))
+        array.get(arr, idx)
+
+// percentiles on closed bars
+volLowThresh = f_percentile_from_series(ta.atr(atrLen), featureLookback, lowVolPct)
+volHighThresh = f_percentile_from_series(ta.atr(atrLen), featureLookback, highVolPct)
+bodyLowThresh = f_percentile_from_series(bodyToRange, featureLookback, bodyPctLow)
+bodyHighThresh = f_percentile_from_series(bodyToRange, featureLookback, bodyPctHigh)
+
+// fallbacks
+volLowThresh := na(volLowThresh) ? atr * 0.8 : volLowThresh
+volHighThresh := na(volHighThresh) ? atr * 1.2 : volHighThresh
+bodyLowThresh := na(bodyLowThresh) ? 0.15 : bodyLowThresh
+bodyHighThresh := na(bodyHighThresh) ? 0.65 : bodyHighThresh
+
+// ----------------- Regime detection -----------------
+// 0 = Chop, 1 = LowVolBalanced, 2 = HighVolDirectional
+var int regime = 0
+var int newRegime = 0
+if atr <= volLowThresh and bodyToRange >= bodyLowThresh and bodyToRange <= bodyHighThresh and wickSym > 0.6
+    newRegime := 1
+else if atr >= volHighThresh and bodyToRange >= bodyHighThresh
+    newRegime := 2
+else
+    newRegime := 0
+
+// transition logic (confirmed bars only)
+var int pendingRegime = na
+var int pendingSince = na
+if barstate.isconfirmed
+    if newRegime != regime
+        pendingRegime := newRegime
+        pendingSince := 0
+    if not na(pendingRegime)
+        pendingSince := nz(pendingSince) + 1
+        if pendingSince >= barsForTransition
+            regime := pendingRegime
+            pendingRegime := na
+            pendingSince := na
+
+// ----------------- Visuals: faint background bands & transition-only label -----------------
+bgcol = regime == 1 ? c_lowvol : regime == 2 ? c_highvol : c_chop
+bgcolor(bgcol)
+
+// transition label (only when regime changed)
+var label transLabel = na  // typed label var
+var bool regimeChanged = false
+regimeChanged := barstate.isconfirmed and (regime != nz(regime[1]))
+if regimeChanged
+    if not na(transLabel)
+        label.delete(transLabel)
+    var string transText = ""   // explicitly typed string
+    transText := regime == 1 ? "Regime → LowVolBalanced" : regime == 2 ? "Regime → HighVolDirectional" : "Regime → Chop"
+    transLabel := label.new(bar_index, high, text=transText, yloc=yloc.abovebar, style=label.style_label_left, textcolor=labelColor, color=color.new(color.black, 80), size=size.small)
+
+// ----------------- Single typed status table (created once) -----------------
+var table statusTbl = table.new(position.top_right, 1, 3)
+
+// show table only on regime transitions (optional)
+if barstate.isconfirmed and regimeChanged and showTable
+    table.cell(statusTbl, 0, 0, "Regime: " + (regime == 1 ? "LowVol" : regime == 2 ? "HighVol" : "Chop"))
+    table.cell(statusTbl, 0, 1, "ATR: " + str.tostring(atr))
+    table.cell(statusTbl, 0, 2, "ATR floor OK: " + (atr_floor_ok ? "Yes" : "No"))
+
+// ----------------- Trend filter (HTF SMA) -----------------
+htf_sma = trendTF == "" ? ta.sma(close, trendLen) : request.security(syminfo.tickerid, trendTF, ta.sma(close, trendLen), lookahead=barmerge.lookahead_off)
+upTrend = close > htf_sma
+downTrend = close < htf_sma
+
+// ----------------- Confirming candle helpers -----------------
+isBullConfirm() =>
+    (close > open) and (close > close[1])
+
+isBearConfirm() =>
+    (close < open) and (close < close[1])
+
+// ----------------- Pivots for breakouts -----------------
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow(low, pivotLeft, pivotRight)
+var float lastPivotHigh = na
+var int lastPivotHighBar = na
+var float lastPivotLow = na
+var int lastPivotLowBar = na
+if not na(ph)
+    lastPivotHigh := ph
+    lastPivotHighBar := bar_index - pivotRight
+if not na(pl)
+    lastPivotLow := pl
+    lastPivotLowBar := bar_index - pivotRight
+
+// ----------------- Signal cooldown/per-regime memory -----------------
+var int lastSignalBarLong = na
+var int lastSignalBarShort = na
+var int lastSignalRegimeLong = na
+var int lastSignalRegimeShort = na
+
+// ----------------- Entry conditions (computed on closed bars) -----------------
+var bool entryLong = false
+var bool entryShort = false
+// reset per-bar
+entryLong := false
+entryShort := false
+
+smaRef = ta.sma(close, math.max(2, math.round(trendLen / 2)))  // mid reference for MR
+
+// Mean Reversion logic (LowVolBalanced)
+if barstate.isconfirmed and enableMR and regime == 1 and atr_floor_ok
+    // distance from mean in ATR units
+    distLong = (smaRef - close) / math.max(atr, small)
+    distShort = (close - smaRef) / math.max(atr, small)
+    mrLongCond = distLong > mr_k
+    mrShortCond = distShort > mr_k
+    // trend gating
+    mrLongTrendOk = not enableTrendFilter ? true : upTrend
+    mrShortTrendOk = not enableTrendFilter ? true : downTrend
+    // confirmation candle check
+    mrLongConfirm = not confirmCandleRequired ? true : isBullConfirm()
+    mrShortConfirm = not confirmCandleRequired ? true : isBearConfirm()
+    if mrLongCond and mrLongTrendOk and mrLongConfirm
+        allow = (na(lastSignalBarLong) or regime != lastSignalRegimeLong or (bar_index - lastSignalBarLong) >= signalCooldownBars)
+        if allow
+            entryLong := true
+            lastSignalBarLong := bar_index
+            lastSignalRegimeLong := regime
+    if mrShortCond and mrShortTrendOk and mrShortConfirm
+        allowS = (na(lastSignalBarShort) or regime != lastSignalRegimeShort or (bar_index - lastSignalBarShort) >= signalCooldownBars)
+        if allowS
+            entryShort := true
+            lastSignalBarShort := bar_index
+            lastSignalRegimeShort := regime
+
+// Breakout logic (HighVolDirectional)
+if barstate.isconfirmed and enableBO and regime == 2 and atr_floor_ok
+    boBreakLong = not na(lastPivotHigh) and close > lastPivotHigh
+    boBreakShort = not na(lastPivotLow) and close < lastPivotLow
+    strongCandle = body >= 0.5 * rng
+    boLongTrendOk = not enableTrendFilter ? true : upTrend
+    boShortTrendOk = not enableTrendFilter ? true : downTrend
+    if boBreakLong and boLongTrendOk and (not confirmCandleRequired or strongCandle)
+        allow = (na(lastSignalBarLong) or regime != lastSignalRegimeLong or (bar_index - lastSignalBarLong) >= signalCooldownBars)
+        if allow
+            entryLong := true
+            lastSignalBarLong := bar_index
+            lastSignalRegimeLong := regime
+    if boBreakShort and boShortTrendOk and (not confirmCandleRequired or strongCandle)
+        allowS = (na(lastSignalBarShort) or regime != lastSignalRegimeShort or (bar_index - lastSignalBarShort) >= signalCooldownBars)
+        if allowS
+            entryShort := true
+            lastSignalBarShort := bar_index
+            lastSignalRegimeShort := regime
+
+// ----------------- Signal strength and labels -----------------
+var label sigLabelLong = na
+var label sigLabelShort = na
+
+if barstate.isconfirmed and entryLong
+    var float strength = na
+    if regime == 1
+        strength := (smaRef - close) / math.max(atr, small)
+    else
+        strength := (close - nz(lastPivotHigh, close)) / math.max(atr, small)
+    strengthDisp = math.round(strength * 100) / 100.0
+    label.new(bar_index, low, text="Long (" + str.tostring(strengthDisp) + ")", yloc=yloc.belowbar, style=label.style_label_down, color=color.new(color.green, 5), textcolor=color.white, size=size.small)
+
+if barstate.isconfirmed and entryShort
+    var float strengthS = na
+    if regime == 1
+        strengthS := (close - smaRef) / math.max(atr, small)
+    else
+        strengthS := (nz(lastPivotLow, close) - close) / math.max(atr, small)
+    strengthDispS = math.round(strengthS * 100) / 100.0
+    label.new(bar_index, high, text="Short (" + str.tostring(strengthDispS) + ")", yloc=yloc.abovebar, style=label.style_label_up, color=color.new(color.red, 5), textcolor=color.white, size=size.small)
+
+// ----------------- Risk display (computed, not executed) -----------------
+atr_now = atr
+stopLong = entryLong ? close - 1.5 * atr_now : na
+targetLong = entryLong ? close + 1.5 * atr_now : na
+stopShort = entryShort ? close + 1.5 * atr_now : na
+targetShort = entryShort ? close - 1.5 * atr_now : na
+
+// ----------------- Global plotting (no local-scope plotshape calls) -----------------
+plotshape(series=entryLong, title="RK Long", location=location.belowbar, color=color.new(color.green, 0), style=shape.triangleup, size=size.small)
+plotshape(series=entryShort, title="RK Short", location=location.abovebar, color=color.new(color.red, 0), style=shape.triangledown, size=size.small)
+
+alertcondition(entryLong, title="RegimeKaleido Long", message="Regime Kaleidoscope: Long signal on {{ticker}}")
+alertcondition(entryShort, title="RegimeKaleido Short", message="Regime Kaleidoscope: Short signal on {{ticker}}")

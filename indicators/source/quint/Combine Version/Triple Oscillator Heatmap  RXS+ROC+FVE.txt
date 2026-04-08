@@ -1,0 +1,554 @@
+//@version=5
+indicator("Triple Oscillator Heatmap — RSX+ROC+FVE", overlay=true, max_bars_back=5000, max_labels_count=500)
+
+// ====================================================
+// ==================== INPUTS ========================
+// ====================================================
+
+// === Shared Settings ===
+sigLen = input. int(20, "Signal Length", minval=2, group="Shared")
+sigPhase = input.int(100, "Signal Phase", minval=-100, maxval=100, group="Shared")
+sigPower = input.int(2, "Signal Power", minval=1, maxval=4, group="Shared")
+mad_mult = input.float(1.0, "MAD Band Multiplier", step=0.1, group="Shared")
+zlen = input.int(8, "Z-score Length", group="Shared")
+zthresh = input.float(1.0, "Z-score Threshold", step=0.1, group="Shared")
+
+// Shared Advanced Settings
+useCyclicSmoothed = input.bool(false, "Use Cyclic Smoothed", group="Shared Advanced")
+dom_cycle_length = input.int(20, "Dominant Cycle Length", minval=0, group="Shared Advanced")
+vibration_input = input.float(10, "Vibration", group="Shared Advanced")
+leveling_input = input.float(10.0, "Leveling", group="Shared Advanced")
+outIFT_scale = input.float(0.1, "Output IFT Scale", minval=0.01, maxval=10.0, step=0.01, group="Shared Advanced")
+
+// Shared JMA Line Settings
+mean_dev_len = input.int(100, "Mean Dev Length", minval=5, group="Shared JMA Settings")
+min_jma_len = input.int(5, "Min JMA Length", minval=1, group="Shared JMA Settings")
+max_jma_len = input.int(30, "Max JMA Length", minval=8, group="Shared JMA Settings")
+jma_phase = input.int(100, "JMA Phase", minval=-100, maxval=100, group="Shared JMA Settings")
+jma_power = input.int(2, "JMA Power", minval=1, maxval=4, group="Shared JMA Settings")
+derivative_smooth_len = input.int(1, "Additional Derivative Smoothing", minval=0, maxval=10, group="Shared JMA Settings")
+
+// === RSX Settings ===
+rsx_len = input.int(14, "RSX Length", minval=2, group="RSX")
+rsx_use_ift = input.bool(true, "RSX Apply IFT", group="RSX")
+rsx_base_jma_len = input.int(5, "RSX Base JMA Length", minval=1, group="RSX")
+
+// === ROC Settings ===
+roc_len = input.int(14, "ROC Length", minval=1, group="ROC")
+roc_source = input.source(close, "ROC Source", group="ROC")
+roc_use_ift = input.bool(true, "ROC Apply IFT", group="ROC")
+roc_base_jma_len = input.int(5, "ROC Base JMA Length", minval=1, group="ROC")
+
+// === FVE Settings ===
+fve_sample = input.int(8, "FVE Sample Length", minval=1, group="FVE")
+fve_cutoff = input.float(0.003, "FVE Cutoff", step=0.001, group="FVE")
+fve_use_cvd = input.bool(true, "Use Cumulative Delta Volume", group="FVE", tooltip="Use cumulative delta volume instead of regular volume")
+fve_use_ift = input.bool(true, "FVE Apply IFT", group="FVE")
+fve_base_jma_len = input.int(5, "FVE Base JMA Length", minval=1, group="FVE")
+fve_norm_len = input.int(500, "FVE Normalization Length", minval=50, group="FVE")
+
+// === KDE Settings ===
+kde_pivot_len = input.int(21, "KDE Pivot Length", minval=1, group="KDE")
+kde_activation = input.string("Medium", "KDE Activation", options=["High", "Medium", "Low"], group="KDE")
+kde_kernel = input.string("Gaussian", "KDE Kernel", options=['Uniform', 'Gaussian', 'Sigmoid'], group="KDE")
+kde_bandwidth = input.float(2.71828, "KDE Bandwidth", group="KDE")
+kde_steps = input.int(100, "KDE Bins", minval=1, group="KDE")
+kde_limit = 300
+
+// === Peak Detection ===
+enable_peaks = input.bool(true, "Enable Peak Detection", group="Peaks")
+derivative_tolerance = input.float(0.5, "Peak Tolerance", minval=0.1, maxval=5.0, step=0.1, group="Peaks")
+
+// === Display Options ===
+show_candle_colors = input.bool(true, "Color Candles by Consensus", group="Display")
+show_kde_dots = input.bool(true, "Show KDE Dots", group="Display")
+show_peak_diamonds = input.bool(true, "Show Peak Diamonds", group="Display")
+show_score_labels = input.bool(true, "Show Consensus Score Labels", group="Display")
+min_score_label = input.int(2, "Min Score for Label", minval=2, maxval=3, group="Display")
+
+// === Color Scheme ===
+color_strong_bull = input.color(color.new(color.lime, 0), "Strong Bullish (3/3)", group="Colors", inline="c1")
+color_med_bull = input.color(color.new(color.green, 30), "Medium Bullish (2/3)", group="Colors", inline="c2")
+color_weak_bull = input.color(color.new(color.teal, 60), "Weak Bullish (1/3)", group="Colors", inline="c3")
+color_neutral = input.color(color.new(color.gray, 70), "Neutral (0/3)", group="Colors", inline="c4")
+color_weak_bear = input.color(color.new(color.orange, 60), "Weak Bearish (1/3)", group="Colors", inline="c5")
+color_med_bear = input.color(color.new(color.red, 30), "Medium Bearish (2/3)", group="Colors", inline="c6")
+color_strong_bear = input.color(color.new(color.maroon, 0), "Strong Bearish (3/3)", group="Colors", inline="c7")
+
+// ====================================================
+// ================ UTILITY FUNCTIONS =================
+// ====================================================
+
+clamp(x, lo, hi) => math.max(lo, math.min(x, hi))
+
+jma(src, length, phase, power) =>
+    phaseRatio = phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alphaJMA = math.pow(beta, power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jma_val = na
+    e0 := (1 - alphaJMA) * src + alphaJMA * nz(e0[1], src)
+    e1 := (src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jma_val[1], src)) * math.pow(1 - alphaJMA, 2) + math.pow(alphaJMA, 2) * nz(e2[1], 0)
+    jma_val := e2 + nz(jma_val[1], src)
+    jma_val
+
+// KDE Functions
+gaussian(float distance, float bandwidth = 1.0) => 
+    1.0 / math.sqrt(2.0 * math.pi) * math.pow(math.e, -0.5 * math.pow(distance / bandwidth, 2.0))
+
+uniform(float distance, float bandwidth = 1.0) => 
+    (math.abs(distance) > bandwidth) ? 0.0 : 0.5
+
+sigmoid(float distance, float bandwidth = 1.0) => 
+    2.0 / math.pi * (1.0 / (math.pow(math.e, (distance / bandwidth)) + math.pow(math.e, -(distance / bandwidth))))
+
+kde(array<float> arr, string kernel, float bandwidth, int steps) =>
+    arrSize = arr.size()
+    arrRange = arr.range()
+    arrMin = arrRange > 0 ? arr. min() : arr. min()
+    stepCount = arrRange > 0 ? arrRange / steps : 1.0 / steps
+    
+    densityRange = array. new<float>(steps * 2)
+    for i = 0 to (steps * 2) - 1
+        densityRange. set(i, arrMin + i * stepCount)
+    
+    xArr = array.new<float>()
+    yArr = array.new<float>()
+    for i = 0 to densityRange.size() - 1
+        float temp = 0
+        for j = 0 to arr.size() - 1
+            switch kernel
+                "Gaussian" => temp += gaussian(densityRange. get(i) - arr.get(j), 1.0 / bandwidth)
+                "Uniform" => temp += uniform(densityRange.get(i) - arr.get(j), 1.0 / bandwidth)
+                "Sigmoid" => temp += sigmoid(densityRange.get(i) - arr.get(j), 1.0 / bandwidth)
+        xArr.push(densityRange.get(i))
+        yArr.push(1.0 / arrSize * temp)
+    [xArr, yArr]
+
+prefixSum(array<float> arr, int l, int r) =>
+    arr.get(r) - (l == 0 ? 0 :  arr.get(l - 1))
+
+// ====================================================
+// ================ RSX CALCULATION ===================
+// ====================================================
+
+// Adaptive JMA input line for RSX
+rsx_mean_dev = ta.stdev(close, mean_dev_len)
+rsx_max_dev = math.max(1e-10, ta.highest(rsx_mean_dev, 100))
+rsx_adaptive_jma_len = rsx_base_jma_len * (rsx_mean_dev / rsx_max_dev)
+rsx_adaptive_jma_len := math.max(min_jma_len, math.min(math.round(rsx_adaptive_jma_len), max_jma_len))
+rsx_input_line = jma(close, rsx_adaptive_jma_len, jma_phase, jma_power)
+
+// Cyclic Smoothed RSI if enabled
+var float rsx_crsi = 0.0
+if useCyclicSmoothed
+    cyclelen = dom_cycle_length / 2
+    torque = 2.0 / (vibration_input + 1)
+    phasingLag = math.round((vibration_input - 1) / 2.0)
+    up = ta.rma(math.max(ta.change(rsx_input_line), 0), cyclelen)
+    down = ta.rma(-math.min(ta.change(rsx_input_line), 0), cyclelen)
+    rsi_val = down == 0 ? 100 : up == 0 ? 0 :  100 - 100 / (1 + up / down)
+    rsx_crsi := torque * (2 * rsi_val - nz(rsi_val[phasingLag])) + (1 - torque) * nz(rsx_crsi[1])
+
+rsx_raw = useCyclicSmoothed ? rsx_crsi : ta.rsi(rsx_input_line, rsx_len)
+rsx_normalized = (rsx_raw - 50) / 50
+rsx_ift = (math.exp(2 * (0.1 * (rsx_raw - 50))) - 1) / (math.exp(2 * (0.1 * (rsx_raw - 50))) + 1)
+rsx_base = rsx_use_ift ? rsx_ift : rsx_normalized
+xout_rsx = clamp(outIFT_scale * rsx_base, -5.0, 5.0)
+rsx_display = (math.exp(2 * xout_rsx) - 1) / (math.exp(2 * xout_rsx) + 1)
+
+rsx_signal = jma(rsx_display, sigLen, sigPhase, sigPower)
+rsx_abs_dev = math.abs(rsx_display - rsx_signal)
+rsx_mad = jma(rsx_abs_dev, sigLen, sigPhase, sigPower)
+rsx_upper = mad_mult * rsx_mad
+rsx_lower = -mad_mult * rsx_mad
+
+rsx_direction = rsx_display > rsx_upper ? 1 : rsx_display < rsx_lower ? -1 : 0
+
+// RSX Z-score & Peaks
+rsx_avg = ta.sma(rsx_display, zlen)
+rsx_std = ta.stdev(rsx_display, zlen)
+rsx_zscore = rsx_std != 0 ? (rsx_display - rsx_avg) / rsx_std : 0.0
+
+rsx_for_derivative = derivative_smooth_len > 1 ? ta. ema(rsx_display, derivative_smooth_len) : rsx_display
+rsx_deriv = rsx_for_derivative - rsx_for_derivative[1]
+rsx_peak = enable_peaks and rsx_deriv[1] > 0 and rsx_deriv < 0 and math.abs(rsx_deriv) < derivative_tolerance and rsx_zscore > 0
+rsx_trough = enable_peaks and rsx_deriv[1] < 0 and rsx_deriv > 0 and math.abs(rsx_deriv) < derivative_tolerance and rsx_zscore < 0
+
+// ====================================================
+// ================ ROC CALCULATION ===================
+// ====================================================
+
+// Adaptive JMA input line for ROC
+roc_mean_dev = ta.stdev(close, mean_dev_len)
+roc_max_dev = math. max(1e-10, ta.highest(roc_mean_dev, 100))
+roc_adaptive_jma_len = roc_base_jma_len * (roc_mean_dev / roc_max_dev)
+roc_adaptive_jma_len := math.max(min_jma_len, math.min(math.round(roc_adaptive_jma_len), max_jma_len))
+roc_input_line = jma(roc_source, roc_adaptive_jma_len, jma_phase, jma_power)
+
+// Calculate base ROC as percentage change
+roc_base_calc = ((roc_input_line - roc_input_line[roc_len]) / roc_input_line[roc_len]) * 100
+
+// Cyclic Smoothed ROC if enabled
+var float roc_croc = 0.0
+if useCyclicSmoothed
+    cyclelen = dom_cycle_length / 2
+    torque = 2.0 / (vibration_input + 1)
+    phasingLag = math.round((vibration_input - 1) / 2.0)
+    roc_croc := torque * (2 * roc_base_calc - nz(roc_base_calc[phasingLag])) + (1 - torque) * nz(roc_croc[1])
+
+roc_raw = useCyclicSmoothed ? roc_croc : roc_base_calc
+
+// Normalize ROC
+roc_target_base = roc_raw / 10
+roc_target_ift = (math.exp(2 * (0.1 * roc_raw)) - 1) / (math.exp(2 * (0.1 * roc_raw)) + 1)
+roc_normalized = roc_use_ift ? nz(roc_target_ift) : nz(roc_target_base)
+
+// Final IFT to strictly bound display line
+xout_roc = clamp(outIFT_scale * roc_normalized, -5.0, 5.0)
+roc_display = (math.exp(2 * xout_roc) - 1) / (math.exp(2 * xout_roc) + 1)
+
+roc_signal = jma(roc_display, sigLen, sigPhase, sigPower)
+roc_abs_dev = math.abs(roc_display - roc_signal)
+roc_mad = jma(roc_abs_dev, sigLen, sigPhase, sigPower)
+roc_upper = mad_mult * roc_mad
+roc_lower = -mad_mult * roc_mad
+
+roc_direction = roc_display > roc_upper ? 1 : roc_display < roc_lower ? -1 : 0
+
+// ROC Z-score & Peaks
+roc_avg = ta.sma(roc_display, zlen)
+roc_std = ta.stdev(roc_display, zlen)
+roc_zscore = roc_std != 0 ? (roc_display - roc_avg) / roc_std : 0.0
+
+roc_for_derivative = derivative_smooth_len > 1 ? ta.ema(roc_display, derivative_smooth_len) : roc_display
+roc_deriv = roc_for_derivative - roc_for_derivative[1]
+roc_peak = enable_peaks and roc_deriv[1] > 0 and roc_deriv < 0 and math.abs(roc_deriv) < derivative_tolerance and roc_zscore > 0
+roc_trough = enable_peaks and roc_deriv[1] < 0 and roc_deriv > 0 and math.abs(roc_deriv) < derivative_tolerance and roc_zscore < 0
+
+// ====================================================
+// =============== FVE CALCULATION ====================
+// ====================================================
+
+// FVE Core Calculation
+fve_calc(closep, highp, lowp, openp, volume, cutoff, sample, useCVD) =>
+    typical_price = (highp + lowp + closep) / 3
+    market_force = closep - (highp + lowp) / 2 + typical_price - nz(typical_price[1])
+    fve_factor = market_force > cutoff * closep ? 1 : market_force < -cutoff * closep ? -1 : 0
+    
+    vol_used = volume
+    if useCVD
+        upVol = volume * (closep > openp ? 1 : 0)
+        downVol = volume * (closep < openp ?  1 : 0)
+        cvd_proxy = ta.cum(upVol - downVol)
+        cvd_delta = math.abs(cvd_proxy - nz(cvd_proxy[1], 0))
+        vol_used := cvd_delta
+    
+    finite = float(na)
+    if bar_index > sample
+        vol_factor = vol_used * fve_factor
+        finite_sum = math.sum(vol_factor, sample)
+        denom = ta.sma(vol_used, sample) * sample
+        finite := denom != 0 ? (finite_sum / denom) * 100 : 0.0
+    finite
+
+fve_raw = fve_calc(close, high, low, open, volume, fve_cutoff, fve_sample, fve_use_cvd)
+
+// Apply adaptive JMA processing
+fve_mean_dev = ta.stdev(fve_raw, mean_dev_len)
+fve_max_dev = math.max(1e-10, ta. highest(fve_mean_dev, 100))
+fve_adaptive_jma_len = fve_base_jma_len * (fve_mean_dev / fve_max_dev)
+fve_adaptive_jma_len := math.max(min_jma_len, math. min(math.round(fve_adaptive_jma_len), max_jma_len))
+fve_input_line = jma(fve_raw, fve_adaptive_jma_len, jma_phase, jma_power)
+
+// Cyclic Smoothed FVE if enabled
+var float fve_cfve = 0.0
+if useCyclicSmoothed
+    cyclelen = dom_cycle_length / 2
+    torque = 2.0 / (vibration_input + 1)
+    phasingLag = math.round((vibration_input - 1) / 2.0)
+    up = ta.rma(math. max(ta.change(fve_input_line), 0), cyclelen)
+    down = ta.rma(-math.min(ta.change(fve_input_line), 0), cyclelen)
+    rsi_val = down == 0 ? 100 : up == 0 ? 0 : 100 - 100 / (1 + up / down)
+    fve_cfve := torque * (2 * rsi_val - nz(rsi_val[phasingLag])) + (1 - torque) * nz(fve_cfve[1])
+
+fve_val_raw = useCyclicSmoothed ? fve_cfve : fve_input_line
+
+// Normalize FVE to bounded range
+fve_highest = ta.highest(fve_val_raw, fve_norm_len)
+fve_lowest = ta.lowest(fve_val_raw, fve_norm_len)
+fve_range = fve_highest - fve_lowest
+fve_normalized = fve_range != 0 ? 2 * (fve_val_raw - fve_lowest) / fve_range - 1 : 0
+
+// Apply IFT if enabled
+fve_target_base = fve_normalized
+fve_target_ift = (math.exp(2 * (0.1 * fve_normalized * 50)) - 1) / (math.exp(2 * (0.1 * fve_normalized * 50)) + 1)
+fve_transformed = fve_use_ift ? nz(fve_target_ift) : nz(fve_target_base)
+
+// Final IFT to strictly bound display line
+xout_fve = clamp(outIFT_scale * fve_transformed, -5.0, 5.0)
+fve_display = (math.exp(2 * xout_fve) - 1) / (math.exp(2 * xout_fve) + 1)
+
+fve_signal = jma(fve_display, sigLen, sigPhase, sigPower)
+fve_abs_dev = math.abs(fve_display - fve_signal)
+fve_mad = jma(fve_abs_dev, sigLen, sigPhase, sigPower)
+fve_upper = mad_mult * fve_mad
+fve_lower = -mad_mult * fve_mad
+
+fve_direction = fve_display > fve_upper ? 1 : fve_display < fve_lower ? -1 :  0
+
+// FVE Z-score & Peaks
+fve_avg = ta.sma(fve_display, zlen)
+fve_std = ta. stdev(fve_display, zlen)
+fve_zscore = fve_std != 0 ? (fve_display - fve_avg) / fve_std : 0.0
+
+fve_for_derivative = derivative_smooth_len > 1 ? ta.ema(fve_display, derivative_smooth_len) : fve_display
+fve_deriv = fve_for_derivative - fve_for_derivative[1]
+fve_peak = enable_peaks and fve_deriv[1] > 0 and fve_deriv < 0 and math.abs(fve_deriv) < derivative_tolerance and fve_zscore > 0
+fve_trough = enable_peaks and fve_deriv[1] < 0 and fve_deriv > 0 and math.abs(fve_deriv) < derivative_tolerance and fve_zscore < 0
+
+// ====================================================
+// ================= KDE PROCESSING ===================
+// ====================================================
+
+activation_threshold = kde_activation == "High" ? 0.4 : kde_activation == "Medium" ? 0.25 : 0.15
+
+// RSX KDE
+var array<float> rsx_pivot_highs = array. new<float>()
+var array<float> rsx_pivot_lows = array.new<float>()
+var array<float> rsx_kde_high_x = na
+var array<float> rsx_kde_high_y = na
+var array<float> rsx_kde_high_ysum = array.new<float>()
+var array<float> rsx_kde_low_x = na
+var array<float> rsx_kde_low_y = na
+var array<float> rsx_kde_low_ysum = array. new<float>()
+
+rsx_ph = ta.pivothigh(rsx_display, kde_pivot_len, kde_pivot_len)
+rsx_pl = ta.pivotlow(rsx_display, kde_pivot_len, kde_pivot_len)
+
+if not na(rsx_ph)
+    if rsx_pivot_highs.size() > kde_limit
+        rsx_pivot_highs. remove(0)
+    rsx_pivot_highs.push(rsx_raw[kde_pivot_len])
+    [x, y] = kde(rsx_pivot_highs, kde_kernel, kde_bandwidth, kde_steps)
+    rsx_kde_high_x := x
+    rsx_kde_high_y := y
+    rsx_kde_high_ysum. clear()
+    temp = 0.0
+    for i = 0 to y.size() - 1
+        temp += y. get(i)
+        rsx_kde_high_ysum.push(temp)
+
+if not na(rsx_pl)
+    if rsx_pivot_lows.size() > kde_limit
+        rsx_pivot_lows.remove(0)
+    rsx_pivot_lows.push(rsx_raw[kde_pivot_len])
+    [x, y] = kde(rsx_pivot_lows, kde_kernel, kde_bandwidth, kde_steps)
+    rsx_kde_low_x := x
+    rsx_kde_low_y := y
+    rsx_kde_low_ysum.clear()
+    temp = 0.0
+    for i = 0 to y.size() - 1
+        temp += y.get(i)
+        rsx_kde_low_ysum.push(temp)
+
+// ROC KDE
+var array<float> roc_pivot_highs = array.new<float>()
+var array<float> roc_pivot_lows = array.new<float>()
+var array<float> roc_kde_high_x = na
+var array<float> roc_kde_high_y = na
+var array<float> roc_kde_high_ysum = array.new<float>()
+var array<float> roc_kde_low_x = na
+var array<float> roc_kde_low_y = na
+var array<float> roc_kde_low_ysum = array.new<float>()
+
+roc_ph = ta.pivothigh(roc_display, kde_pivot_len, kde_pivot_len)
+roc_pl = ta.pivotlow(roc_display, kde_pivot_len, kde_pivot_len)
+
+if not na(roc_ph)
+    if roc_pivot_highs.size() > kde_limit
+        roc_pivot_highs.remove(0)
+    roc_pivot_highs.push(roc_raw[kde_pivot_len])
+    [x, y] = kde(roc_pivot_highs, kde_kernel, kde_bandwidth, kde_steps)
+    roc_kde_high_x := x
+    roc_kde_high_y := y
+    roc_kde_high_ysum.clear()
+    temp = 0.0
+    for i = 0 to y.size() - 1
+        temp += y.get(i)
+        roc_kde_high_ysum.push(temp)
+
+if not na(roc_pl)
+    if roc_pivot_lows.size() > kde_limit
+        roc_pivot_lows.remove(0)
+    roc_pivot_lows.push(roc_raw[kde_pivot_len])
+    [x, y] = kde(roc_pivot_lows, kde_kernel, kde_bandwidth, kde_steps)
+    roc_kde_low_x := x
+    roc_kde_low_y := y
+    roc_kde_low_ysum. clear()
+    temp = 0.0
+    for i = 0 to y.size() - 1
+        temp += y. get(i)
+        roc_kde_low_ysum. push(temp)
+
+// FVE KDE
+var array<float> fve_pivot_highs = array.new<float>()
+var array<float> fve_pivot_lows = array.new<float>()
+var array<float> fve_kde_high_x = na
+var array<float> fve_kde_high_y = na
+var array<float> fve_kde_high_ysum = array. new<float>()
+var array<float> fve_kde_low_x = na
+var array<float> fve_kde_low_y = na
+var array<float> fve_kde_low_ysum = array.new<float>()
+
+fve_ph = ta.pivothigh(fve_display, kde_pivot_len, kde_pivot_len)
+fve_pl = ta.pivotlow(fve_display, kde_pivot_len, kde_pivot_len)
+
+if not na(fve_ph)
+    if fve_pivot_highs.size() > kde_limit
+        fve_pivot_highs.remove(0)
+    fve_pivot_highs.push(fve_raw[kde_pivot_len])
+    [x, y] = kde(fve_pivot_highs, kde_kernel, kde_bandwidth, kde_steps)
+    fve_kde_high_x := x
+    fve_kde_high_y := y
+    fve_kde_high_ysum. clear()
+    temp = 0.0
+    for i = 0 to y.size() - 1
+        temp += y. get(i)
+        fve_kde_high_ysum. push(temp)
+
+if not na(fve_pl)
+    if fve_pivot_lows.size() > kde_limit
+        fve_pivot_lows.remove(0)
+    fve_pivot_lows.push(fve_raw[kde_pivot_len])
+    [x, y] = kde(fve_pivot_lows, kde_kernel, kde_bandwidth, kde_steps)
+    fve_kde_low_x := x
+    fve_kde_low_y := y
+    fve_kde_low_ysum.clear()
+    temp = 0.0
+    for i = 0 to y.size() - 1
+        temp += y.get(i)
+        fve_kde_low_ysum.push(temp)
+
+// Calculate KDE signals
+get_kde_signal(val, kde_low_x, kde_low_y, kde_low_ysum, kde_high_x, kde_high_y, kde_high_ysum, thresh) =>
+    int signal = 0
+    if not na(kde_low_y) and not na(kde_high_y)
+        lowXIndexL = array.binary_search_leftmost(kde_low_x, val)
+        lowXIndexR = math.min(array.binary_search_rightmost(kde_low_x, val), kde_low_x.size() - 1)
+        nearestLow = (math.abs(val - kde_low_x.get(lowXIndexL)) < math.abs(val - kde_low_x.get(lowXIndexR))) ? lowXIndexL : lowXIndexR
+        lowProb = prefixSum(kde_low_ysum, nearestLow, kde_low_ysum.size() - 1)
+        
+        highXIndexL = array. binary_search_leftmost(kde_high_x, val)
+        highXIndexR = math. min(array.binary_search_rightmost(kde_high_x, val), kde_high_x.size() - 1)
+        nearestHigh = (math.abs(val - kde_high_x.get(highXIndexL)) < math.abs(val - kde_high_x.get(highXIndexR))) ? highXIndexL : highXIndexR
+        highProb = prefixSum(kde_high_ysum, 0, nearestHigh)
+        
+        if lowProb > kde_low_y. sum() * (1.0 - thresh)
+            signal := 1
+        else if highProb > kde_high_y.sum() * (1.0 - thresh)
+            signal := -1
+    signal
+
+rsx_kde_signal = get_kde_signal(rsx_raw, rsx_kde_low_x, rsx_kde_low_y, rsx_kde_low_ysum, rsx_kde_high_x, rsx_kde_high_y, rsx_kde_high_ysum, activation_threshold)
+roc_kde_signal = get_kde_signal(roc_raw, roc_kde_low_x, roc_kde_low_y, roc_kde_low_ysum, roc_kde_high_x, roc_kde_high_y, roc_kde_high_ysum, activation_threshold)
+fve_kde_signal = get_kde_signal(fve_raw, fve_kde_low_x, fve_kde_low_y, fve_kde_low_ysum, fve_kde_high_x, fve_kde_high_y, fve_kde_high_ysum, activation_threshold)
+
+// ====================================================
+// ============== CONSENSUS CALCULATION ===============
+// ====================================================
+
+// Direction consensus (from MAD bands)
+bullish_count = (rsx_direction == 1 ? 1 :  0) + (roc_direction == 1 ? 1 : 0) + (fve_direction == 1 ? 1 : 0)
+bearish_count = (rsx_direction == -1 ?  1 : 0) + (roc_direction == -1 ? 1 : 0) + (fve_direction == -1 ? 1 :  0)
+
+consensus_score = bullish_count - bearish_count  // Range: -3 to +3
+
+// KDE consensus
+kde_bullish = (rsx_kde_signal == 1 ? 1 :  0) + (roc_kde_signal == 1 ?  1 : 0) + (fve_kde_signal == 1 ? 1 :  0)
+kde_bearish = (rsx_kde_signal == -1 ? 1 : 0) + (roc_kde_signal == -1 ? 1 : 0) + (fve_kde_signal == -1 ? 1 : 0)
+
+// Peak/Trough consensus
+peak_count = (rsx_peak ?  1 : 0) + (roc_peak ? 1 : 0) + (fve_peak ? 1 :  0)
+trough_count = (rsx_trough ?  1 : 0) + (roc_trough ? 1 : 0) + (fve_trough ? 1 : 0)
+
+// ====================================================
+// ================= VISUALIZATION ====================
+// ====================================================
+
+// Candle coloring by consensus
+candle_color = consensus_score == 3 ? color_strong_bull : 
+               consensus_score == 2 ? color_med_bull :
+               consensus_score == 1 ? color_weak_bull :
+               consensus_score == -1 ? color_weak_bear :
+               consensus_score == -2 ? color_med_bear :
+               consensus_score == -3 ? color_strong_bear : 
+               color_neutral
+
+barcolor(show_candle_colors ? candle_color : na, title="Consensus Candle Color")
+
+// KDE Dots (2/3 and 3/3 only)
+kde_dot_color_bull = kde_bullish == 3 ? color_strong_bull : 
+                     kde_bullish == 2 ? color_med_bull :  na
+
+kde_dot_color_bear = kde_bearish == 3 ? color_strong_bear : 
+                     kde_bearish == 2 ? color_med_bear : na
+
+plotshape(show_kde_dots and kde_bullish == 3, title="KDE Bull 3/3", 
+          location=location.belowbar, color=kde_dot_color_bull, style=shape.circle, size=size.normal)
+plotshape(show_kde_dots and kde_bullish == 2, title="KDE Bull 2/3", 
+          location=location.belowbar, color=kde_dot_color_bull, style=shape.circle, size=size.small)
+
+plotshape(show_kde_dots and kde_bearish == 3, title="KDE Bear 3/3", 
+          location=location.abovebar, color=kde_dot_color_bear, style=shape. circle, size=size.normal)
+plotshape(show_kde_dots and kde_bearish == 2, title="KDE Bear 2/3", 
+          location=location.abovebar, color=kde_dot_color_bear, style=shape.circle, size=size.small)
+
+// Peak Diamonds (2/3 and 3/3 only)
+peak_diamond_color = peak_count == 3 ? color_strong_bear :
+                     peak_count == 2 ? color_med_bear : na
+
+trough_diamond_color = trough_count == 3 ? color_strong_bull :
+                       trough_count == 2 ? color_med_bull : na
+
+plotshape(show_peak_diamonds and peak_count == 3, title="Peak 3/3", 
+          location=location.abovebar, color=peak_diamond_color, style=shape.diamond, size=size.normal)
+plotshape(show_peak_diamonds and peak_count == 2, title="Peak 2/3", 
+          location=location. abovebar, color=peak_diamond_color, style=shape. diamond, size=size.small)
+
+plotshape(show_peak_diamonds and trough_count == 3, title="Trough 3/3", 
+          location=location. belowbar, color=trough_diamond_color, style=shape.diamond, size=size.normal)
+plotshape(show_peak_diamonds and trough_count == 2, title="Trough 2/3", 
+          location=location.belowbar, color=trough_diamond_color, style=shape.diamond, size=size.small)
+
+// Consensus Score Labels
+if show_score_labels and barstate.isconfirmed
+    if math.abs(consensus_score) >= min_score_label
+        label_text = "Score: " + str. tostring(consensus_score) + "\nKDE: +" + str.tostring(kde_bullish) + "/-" + str.tostring(kde_bearish)
+        label_color = consensus_score > 0 ? color. new(color.green, 20) : color.new(color.red, 20)
+        label_y = consensus_score > 0 ? low :  high
+        label_style = consensus_score > 0 ? label. style_label_up : label.style_label_down
+        label. new(bar_index, label_y, label_text, color=label_color, textcolor=color.white, 
+                  style=label_style, size=size.small)
+
+// ====================================================
+// ================== ALERTS ==========================
+// ====================================================
+
+alertcondition(consensus_score == 3, "Strong Bullish Consensus", "All 3 oscillators bullish!")
+alertcondition(consensus_score == -3, "Strong Bearish Consensus", "All 3 oscillators bearish!")
+alertcondition(consensus_score == 2, "Medium Bullish Consensus", "2 of 3 oscillators bullish")
+alertcondition(consensus_score == -2, "Medium Bearish Consensus", "2 of 3 oscillators bearish")
+
+alertcondition(kde_bullish == 3, "Triple KDE Bullish", "All 3 KDE signals bullish!")
+alertcondition(kde_bearish == 3, "Triple KDE Bearish", "All 3 KDE signals bearish!")
+alertcondition(kde_bullish == 2, "Double KDE Bullish", "2 of 3 KDE signals bullish")
+alertcondition(kde_bearish == 2, "Double KDE Bearish", "2 of 3 KDE signals bearish")
+
+alertcondition(peak_count == 3, "Triple Peak", "All 3 oscillators peaked!")
+alertcondition(trough_count == 3, "Triple Trough", "All 3 oscillators troughed!")
+alertcondition(peak_count == 2, "Double Peak", "2 of 3 oscillators peaked")
+alertcondition(trough_count == 2, "Double Trough", "2 of 3 oscillators troughed")

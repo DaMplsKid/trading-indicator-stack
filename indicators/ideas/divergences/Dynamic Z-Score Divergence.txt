@@ -1,0 +1,503 @@
+//@version=6
+indicator("Uptrick: Dynamic Z-Score Divergence", "DZD", overlay = false)
+
+//────────────────────────────────────────────
+// Inputs
+//────────────────────────────────────────────
+
+general = "General"
+main_inp = input.bool(false, "Full Setup", group = general)
+
+lenZ        = input.int(100,  "Z-Score Lookback")
+smoothLen   = input.int(10,   "Main Line Smoothing")
+slopeIndex  = input.int(1, "Slope Detection Index", minval = 1)
+
+useBgColor            = input.bool(true,  "Enable Background Highlighting")
+showHelperScaleLines  = input.bool(true,  "Force Visible Y-Axis Scale")
+
+// Divergence settings (Mean Reversion-style)
+enableDivergence = input.bool(true, title = "Enable Divergence Detection", group = "Divergence")
+lookbackLeft     = input.int(15,  minval = 1,  title = "Pivot Lookback Left",  group = "Divergence")
+lookbackRight    = input.int(1,  minval = 1,  title = "Pivot Lookback Right", group = "Divergence")
+rangeMin         = input.int(5,  minval = 1,  title = "Minimum Bars Between Pivots", group = "Divergence")
+rangeMax         = input.int(60, minval = 5,  title = "Maximum Bars Between Pivots", group = "Divergence")
+
+//────────────────────────────────────────────
+// Uptrick palette (classic)
+//────────────────────────────────────────────
+bullMain = color.rgb(0, 254, 220)   // #5CF0D7
+bearMain = #e600ff   // #B32AC3
+
+bullFill = color.new(bullMain, 80)
+bearFill = color.new(bearMain, 80)
+
+//────────────────────────────────────────────
+// Triple Z-Score Momentum (RSI + StochRSI + MACD)
+//────────────────────────────────────────────
+
+// RSI Z
+r    = ta.rsi(close, 14)
+r_ma = ta.sma(r, lenZ)
+r_sd = ta.stdev(r, lenZ)
+r_z  = (r - r_ma) / (r_sd == 0 ? 1 : r_sd)
+
+// StochRSI Z
+stochRSI = ta.stoch(r, r, r, 14)
+k_ma     = ta.sma(stochRSI, lenZ)
+k_sd     = ta.stdev(stochRSI, lenZ)
+k_z      = (stochRSI - k_ma) / (k_sd == 0 ? 1 : k_sd)
+
+// MACD Z (line only)
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
+m_ma = ta.sma(macdLine, lenZ)
+m_sd = ta.stdev(macdLine, lenZ)
+m_z  = (macdLine - m_ma) / (m_sd == 0 ? 1 : m_sd)
+
+// Triple average Z + smoothing
+avgZ     = (r_z + k_z + m_z) / 3.0
+mainLine = ta.ema(avgZ, smoothLen)
+
+//────────────────────────────────────────────
+// Mean-reversion thresholds + regions
+//────────────────────────────────────────────
+outerLevel = 1.5
+
+innerLevel = 1.0 
+
+upperLevel = outerLevel
+lowerLevel = -outerLevel
+innerUpper = innerLevel
+innerLower = -innerLevel
+
+// Force Y-axis range (optional)
+upperLimit = showHelperScaleLines ? 3.0 : na
+lowerLimit = showHelperScaleLines ? -3.0 : na
+plot(main_inp? upperLimit: na, title = "Force Y Max", color = color.new(color.gray, 100))
+plot(main_inp? lowerLimit: na, title = "Force Y Min", color = color.new(color.gray, 100))
+
+//────────────────────────────────────────────
+// Slope-based logic + MR signals
+//────────────────────────────────────────────
+slopePrev = mainLine[slopeIndex] - mainLine[slopeIndex * 2]
+slopeCurr = mainLine - mainLine[slopeIndex]
+slopeFlip = slopePrev * slopeCurr < 0
+
+buySignal  = slopeFlip and slopePrev < 0 and slopeCurr > 0 and mainLine < innerLower
+sellSignal = slopeFlip and slopePrev > 0 and slopeCurr < 0 and mainLine > innerUpper
+
+// Background highlighting for extended regions
+bgcolor(useBgColor and mainLine > upperLevel and main_inp ? bearFill : na)
+bgcolor(useBgColor and mainLine < lowerLevel and main_inp ? bullFill : na)
+
+//────────────────────────────────────────────
+// Oscillator plot (colored by slope)
+//────────────────────────────────────────────
+barColor = slopeCurr > 0 ? bullMain : slopeCurr < 0 ? bearMain : color.gray
+
+
+bullC = #00fec3     
+bearC = color.rgb(212, 0, 236)     
+
+
+// Normalize range from -1.5 to +1.5
+clamped = math.max(-1, math.min(1, mainLine))
+t = (clamped + 1) / 2          // maps -1.5 → 0, 1.5 → 1
+
+// Blend between bull → bear
+c = color.rgb(
+     int(color.r(bullC) * (1 - t) + color.r(bearC) * t),
+     int(color.g(bullC) * (1 - t) + color.g(bearC) * t),
+     int(color.b(bullC) * (1 - t) + color.b(bearC) * t)
+ )
+
+// FINAL PLOT
+plot(main_inp ? mainLine: na, title = "Triple Z-Score", color = c, linewidth = 3)
+
+
+
+
+hline(main_inp ? 0: na,           "Zero Line",   color = color.gray)
+hline(main_inp ? upperLevel: na,  "Overbought",  color = bearMain)
+hline(main_inp ? lowerLevel: na,  "Oversold",    color = bullMain)
+
+// Highlight inner / outer bands (bullish / bearish regions)
+fill(hline(main_inp ? upperLevel: na), hline(main_inp ? innerUpper: na), color = main_inp ? color.new(bearMain, 80): na) // Bearish shiny zone
+fill(hline(main_inp ? innerLower: na), hline(main_inp ? lowerLevel: na), color = main_inp ? color.new(bullMain, 80): na) // Bullish shiny zone
+// Mark buy/sell MR signals on oscillator
+plotshape(
+     buySignal and main_inp ? mainLine - 0.2 : na,
+     title     = "TP Signal",
+     style     = shape.labelup,
+     location  = location.absolute,
+     color     = bullMain,
+     size      = size.tiny,
+     text      = "✘", textcolor = #000000
+ )
+
+plotshape(
+     sellSignal and main_inp  ? mainLine + 0.2 : na,
+     title      = "TP Signal",
+     style      = shape.labeldown,
+     location   = location.absolute,
+     color      = bearMain,
+     size       = size.tiny,
+     text       = "✘", textcolor = color.white
+ )
+
+//────────────────────────────────────────────
+// Divergence detection (Mean Reversion-style)
+// mainLine vs price (low/high)
+//────────────────────────────────────────────
+pl = ta.pivotlow(mainLine,  lookbackLeft, lookbackRight)
+ph = ta.pivothigh(mainLine, lookbackLeft, lookbackRight)
+
+var float prevPL_Z     = na
+var float prevPL_Price = na
+var int   prevPL_Bar   = na
+
+var float prevPH_Z     = na
+var float prevPH_Price = na
+var int   prevPH_Bar   = na
+
+bullCond = false
+bearCond = false
+
+oscLBR = mainLine[lookbackRight]
+
+if enableDivergence
+    //───────────────
+    // Bullish divergence (LL in price, HL in oscillator)
+    //───────────────
+    if not na(pl)
+        currZ     = mainLine[lookbackRight]
+        currPrice = low[lookbackRight]
+
+        zUp         = not na(prevPL_Z)     and currZ > prevPL_Z
+        priceDown   = not na(prevPL_Price) and currPrice < prevPL_Price
+        barsBetween = bar_index - lookbackRight - prevPL_Bar
+
+        if zUp and priceDown and rangeMin <= barsBetween and barsBetween <= rangeMax
+            bullCond := true
+
+        prevPL_Z     := currZ
+        prevPL_Price := currPrice
+        prevPL_Bar   := bar_index - lookbackRight
+
+    //───────────────
+    // Bearish divergence (HH in price, LH in oscillator)
+    //───────────────
+    if not na(ph)
+        currZ     = mainLine[lookbackRight]
+        currPrice = high[lookbackRight]
+
+        zDown       = not na(prevPH_Z)     and currZ < prevPH_Z
+        priceUp     = not na(prevPH_Price) and currPrice > prevPH_Price
+        barsBetween = bar_index - lookbackRight - prevPH_Bar
+
+        if zDown and priceUp and rangeMin <= barsBetween and barsBetween <= rangeMax
+            bearCond := true
+
+        prevPH_Z     := currZ
+        prevPH_Price := currPrice
+        prevPH_Bar   := bar_index - lookbackRight
+
+//────────────────────────────────────────────
+// Divergence visualization (same style)
+//────────────────────────────────────────────
+noneColor = color.new(color.white, 100)
+
+// Bullish divergence line + label on oscillator
+plot(not na(pl) and main_inp ? oscLBR : na,
+     offset = -lookbackRight,
+     title  = "Regular Bullish Divergence",
+     linewidth = 2,
+     color  = (bullCond ? bullMain : noneColor))
+
+plotshape(
+     bullCond and main_inp ? oscLBR : na,
+     offset   = -lookbackRight,
+     title    = "Bullish Divergence Label",
+     text     = " 𝓑𝓾𝓵𝓵 ",
+     style    = shape.labelup,
+     location = location.absolute,
+     color    = bullMain,
+     textcolor = #000000,
+     size     = size.tiny
+ )
+
+
+
+
+
+
+
+// Bearish divergence line + label on oscillator
+plot(not na(ph) and main_inp ? oscLBR : na,
+     offset = -lookbackRight,
+     title  = "Regular Bearish Divergence",
+     linewidth = 2,
+     color  = (bearCond ? bearMain : noneColor))
+
+plotshape(
+     bearCond and main_inp  ? oscLBR : na,
+     offset   = -lookbackRight,
+     title    = "Bearish Divergence Label",
+     text     = " 𝓑𝓮𝓪𝓻 ",
+     style    = shape.labeldown,
+     location = location.absolute,
+     color    = bearMain,
+     textcolor = color.white,
+     size     = size.tiny
+ )
+
+
+
+
+
+
+
+
+//────────────────────────────────────────────
+// Divergence Labels (Clean Rewrite)
+//────────────────────────────────────────────
+
+atrVal = ta.atr(14)
+
+// Bullish → below price
+yUp = low - atrVal * 0.6
+
+// Bearish → above price
+yDn = high + atrVal * 0.6
+
+// Bullish Divergence Label
+if bullCond 
+    label.new(
+         bar_index,
+         yUp,
+         text = "𝓤𝓹",
+         style = label.style_label_up,
+         size = size.normal,
+         color = color.rgb(92,240,215),
+         textcolor = color.black,
+         force_overlay = true
+     )
+
+// Bearish Divergence Label
+if bearCond 
+    label.new(
+         bar_index,
+         yDn,
+         text = "𝓓𝓸𝔀𝓷",
+         style = label.style_label_down,
+         size = size.normal,
+         color = color.rgb(179,42,195),
+         textcolor = color.white,
+         force_overlay = true
+     )
+
+
+
+
+
+
+//────────────────────────────────────────────
+// Alerts
+//────────────────────────────────────────────
+alertcondition(buySignal,  title = "TZM: Buy Signal",  message = "🔔 Triple Z-Score MR: Buy Signal Detected")
+alertcondition(sellSignal, title = "TZM: Sell Signal", message = "🔔 Triple Z-Score MR: Sell Signal Detected")
+
+alertcondition(bullCond,   title = "TZM: Bullish Divergence", message = "🔔 Triple Z-Score: Bullish Divergence Confirmed")
+alertcondition(bearCond,   title = "TZM: Bearish Divergence", message = "🔔 Triple Z-Score: Bearish Divergence Confirmed")
+
+
+
+
+//────────────────────────────────────────────
+// BAR COLOR SYSTEM
+//────────────────────────────────────────────
+barColorGroup = "Bar Coloring"
+barColorMode = input.string("Line Color", "Bar Coloring Mode", 
+     options = ["Line Color", "Latest Confirmed Signal", "Any Latest Signal"], 
+     group = barColorGroup)
+
+// Colors
+bullBarCol = bullMain
+bearBarCol = bearMain
+
+//──────────────
+// 1) Line Color Mode
+//──────────────
+// Just use the oscillator heat color 'c'
+lineColorBar = c
+
+
+
+//──────────────
+// 2) Latest Confirmed Divergence Only
+//──────────────
+var int lastDiv = 0     // 1 = bull, -1 = bear
+
+if bullCond
+    lastDiv := 1
+
+if bearCond
+    lastDiv := -1
+
+divBarColor = lastDiv == 1 ? bullBarCol :
+              lastDiv == -1 ? bearBarCol : na
+
+
+
+//──────────────
+// 3) Any Latest Signal (TP or Divergence)
+//──────────────
+var int lastAny = 0     // 1 = bull, -1 = bear
+
+// Divergences
+if bullCond
+    lastAny := 1
+
+if bearCond
+    lastAny := -1
+
+// TP Signals
+if buySignal
+    lastAny := 1
+
+if sellSignal
+    lastAny := -1
+
+anySignalColor = lastAny == 1 ? bullBarCol :
+                 lastAny == -1 ? bearBarCol : na
+
+
+
+//────────────────────────────────────────────
+// FINAL BAR COLOR SELECTION
+//────────────────────────────────────────────
+finalBarColor =
+     barColorMode == "Line Color"              ? lineColorBar :
+     barColorMode == "Latest Confirmed Signal" ? divBarColor   :
+     barColorMode == "Any Latest Signal"       ? anySignalColor :
+     na
+
+barcolor(finalBarColor)
+plotcandle(open, high, low , close, "Plotcandle",finalBarColor, finalBarColor,true,bordercolor = finalBarColor, force_overlay = true)
+
+
+
+
+//────────────────────────────────────────────
+// UPTRICK SA-EMA SYSTEM (FULL MODULE)
+//────────────────────────────────────────────
+
+// Group
+saemaGroup = "SA-EMA Settings"
+
+// Inputs
+sa_rsiLen      = input.int(21,   "RSI Length",           minval = 1, group = saemaGroup)
+sa_zLen        = input.int(200,  "Z-Score Length",       minval = 10, group = saemaGroup)
+sa_baseLen     = input.int(80,   "Base EMA Length",      minval = 1, group = saemaGroup)
+sa_intensity   = input.float(0.15, "Adaptivity Intensity", minval = 0, maxval = 1, group = saemaGroup)
+sa_slopeIndex  = input.int(1,    "Slope Index",          minval = 1, group = saemaGroup)
+sa_bandAtrLen  = input.int(14,   "Band ATR Length",      minval = 1, group = saemaGroup)
+sa_bandMult    = input.float(1.4, "Band Multiplier",     minval = 0.1, group = saemaGroup)
+
+// Uptrick colors
+saUpColor   = color.rgb(0,254,220)   // bullMain
+saDownColor = #e600ff                // bearMain
+
+//────────────────────────────────────────────
+// Custom tanh (Pine compatible)
+//────────────────────────────────────────────
+f_tanh(x) =>
+    e2x = math.exp(2 * x)
+    (e2x - 1) / (e2x + 1)
+
+//────────────────────────────────────────────
+// SA-EMA Calculation
+//────────────────────────────────────────────
+src = close
+
+// RSI + Z-Score
+rsiValue = ta.rsi(src, sa_rsiLen)
+rsiMA    = ta.sma(rsiValue, sa_zLen)
+rsiSD    = ta.stdev(rsiValue, sa_zLen)
+zRaw     = (rsiValue - rsiMA) / (rsiSD == 0 ? 1 : rsiSD)
+
+// softened Z
+zSoft = f_tanh(zRaw * 0.4)
+zAbs  = math.abs(zSoft)
+
+// adaptive smoothing factor
+baseAlpha  = 2.0 / sa_baseLen
+adaptBoost = zAbs * sa_intensity
+alpha      = baseAlpha + adaptBoost
+
+// final SA-EMA
+var float SAEMA = na
+SAEMA := na(SAEMA[1]) ? src : SAEMA[1] + alpha * (src - SAEMA[1])
+
+//────────────────────────────────────────────
+// Slope coloring
+//────────────────────────────────────────────
+slope = SAEMA - SAEMA[sa_slopeIndex]
+
+saColor =
+     slope > 0 ? saUpColor :
+     slope < 0 ? saDownColor :
+     color.gray
+
+// plot SA-EMA
+
+
+
+//────────────────────────────────────────────
+// SA-EMA Bands (Slope-Based Visibility)
+//────────────────────────────────────────────
+
+// ATR-based band width
+saAtr      = ta.atr(sa_bandAtrLen)
+saBandDiff = saAtr * sa_bandMult
+
+// Bands around SAEMA
+saUpper = SAEMA + saBandDiff
+saLower = SAEMA - saBandDiff
+
+// Slope conditions (use same slope as SA-EMA)
+bullSlope = slope > 0
+bearSlope = slope < 0
+
+// Visibility rules:
+// Bullish slope → ONLY lower band visible
+// Bearish slope → ONLY upper band visible
+// Neutral slope → show both
+
+upperColor =
+     bullSlope ? color.new(saDownColor, 100) :       // hide upper in bullish slope
+     bearSlope ? saDownColor :
+     saDownColor
+
+lowerColor =
+     bearSlope ? color.new(saUpColor, 100) :         // hide lower in bearish slope
+     bullSlope ? saUpColor :
+     saUpColor
+
+// Plot bands
+pU = plot(saUpper, "Upper Band",  color = upperColor, linewidth = 1, force_overlay = true)
+pL = plot(saLower, "Lower Band",  color = lowerColor, linewidth = 1, force_overlay = true)
+main = plot(SAEMA, "SA-EMA", color = saColor, linewidth = 1, force_overlay = true)
+
+// Soft interior fill
+//────────────────────────────────────────────
+// SA-EMA Active Band Fill (No Local Scope Errors)
+//────────────────────────────────────────────
+
+
+bullfillcolor = bullSlope ? color.new(saUpColor, 50) : na
+bearfillcolor = bearSlope ? color.new(saDownColor, 50) : na
+
+// fill(plot1, plot2, top_value, bottom_value, top_color, bottom_color)
+
+fill(main, pU, saUpper,SAEMA, bearfillcolor, color.new(color.black ,100))
+fill(main, pL, SAEMA, saLower, color.new(color.black ,100), bullfillcolor)

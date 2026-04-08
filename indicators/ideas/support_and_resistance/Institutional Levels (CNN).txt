@@ -1,0 +1,617 @@
+//@version=6
+indicator('Institutional Levels (Convolutional Neural Network-inspired) - [PhenLabs]', shorttitle = 'InstZones - PhenLabs', overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ===== SECTION 1: INPUTS AND CONSTANTS =====
+// Core Parameters
+lookbackBars = input.int(500, title = 'Lookback Bars', minval = 100, maxval = 1000) // Reduced for performance
+kLeftRight = input.int(3, title = 'Pivot Left/Right', minval = 1, maxval = 10)
+alphaBinATR = input.float(0.25, title = 'Bin Size (ATR units)', minval = 0.1, maxval = 2.0, step = 0.05)
+wBaseATR = input.float(0.25, title = 'Base Zone Half-Width (ATR units)', minval = 0.1, maxval = 1.0, step = 0.05)
+mergeIoU = input.float(0.5, title = 'Zone Merge IoU Threshold', minval = 0.1, maxval = 0.9, step = 0.1)
+maxZones = input.int(5, title = 'Max Active Zones', minval = 3, maxval = 20)
+maxPivotsPerUpdate = input.int(50, title = 'Max Pivots Per Update', minval = 10, maxval = 100) // New optimization parameter
+
+// Reaction Analysis
+H = input.int(50, title = 'Reaction Horizon (bars)', minval = 10, maxval = 200)
+thetaATR = input.float(1.0, title = 'Favorable Excursion Threshold (ATR)', minval = 0.5, maxval = 3.0, step = 0.1)
+phiATR = input.float(0.5, title = 'Adverse Excursion Threshold (ATR)', minval = 0.2, maxval = 2.0, step = 0.1)
+probThreshold = input.float(0.6, title = 'Probability Threshold for Labels', minval = 0.3, maxval = 0.9, step = 0.05)
+liveStrict = input.bool(true, title = 'Strict Non-Repainting Mode')
+
+// Optional Features
+enableMiniConvs = input.bool(false, title = 'Enable Mini-Convolutions', group = 'Advanced')
+enableCoarseVolProfile = input.bool(false, title = 'Enable Coarse Volume Profile', group = 'Advanced')
+updateFrequency = input.int(5, title = 'Zone Update Frequency (bars)', minval = 1, maxval = 50, group = 'Advanced') // More frequent updates
+
+// Session Filtering
+limitSessions = input.bool(true, title = 'Limit to Session Hours', group = 'Session')
+sessionInput = input.session('0930-1600', title = 'Trading Session', group = 'Session')
+
+// Display Options
+showSupport = input.bool(true, title = 'Show Support Zones', group = 'Display')
+showResistance = input.bool(true, title = 'Show Resistance Zones', group = 'Display')
+showLabels = input.bool(true, title = 'Show Labels', group = 'Display')
+showProbabilities = input.bool(true, title = 'Show Probabilities', group = 'Display')
+showFills = input.bool(true, title = 'Show Zone Fills', group = 'Display') // New option for fills
+
+// Logistic Model Weights (user-overridable constants)
+w0 = input.float(-0.8, title = 'w0 (Intercept)', group = 'Model Weights')
+w1 = input.float(-2.2, title = 'w1 (Distance ATR)', group = 'Model Weights')
+w2 = input.float(-0.6, title = 'w2 (Width ATR)', group = 'Model Weights')
+w3 = input.float(0.7, title = 'w3 (Volume Z)', group = 'Model Weights')
+w4 = input.float(-0.4, title = 'w4 (VWAP Diff ATR)', group = 'Model Weights')
+w5 = input.float(0.35, title = 'w5 (Touch Count)', group = 'Model Weights')
+w6 = input.float(1.6, title = 'w6 (Prior Hit Rate)', group = 'Model Weights')
+w7 = input.float(0.5, title = 'w7 (Wick Penetration ATR)', group = 'Model Weights')
+w8 = input.float(0.4, title = 'w8 (Trend Flag)', group = 'Model Weights')
+
+// Mini-Conv Weights
+wgGrad = input.float(0.2, title = 'Gradient Filter Weight', group = 'Model Weights')
+wgSmooth = input.float(0.1, title = 'Smooth Filter Weight', group = 'Model Weights')
+wgDoG = input.float(0.1, title = 'DoG Filter Weight', group = 'Model Weights')
+
+// ===== SECTION 2: UTILITY FUNCTIONS =====
+
+// Clamp function
+f_clamp(val, minVal, maxVal) =>
+    math.max(minVal, math.min(maxVal, val))
+
+// Sigmoid function
+f_sigmoid(x) =>
+    1.0 / (1.0 + math.exp(-x))
+
+// IoU for 1D intervals (bands)
+f_iou1d(a1, a2, b1, b2) =>
+    intersectStart = math.max(a1, b1)
+    intersectEnd = math.min(a2, b2)
+    intersectLen = math.max(0, intersectEnd - intersectStart)
+    unionLen = a2 - a1 + b2 - b1 - intersectLen
+    if unionLen <= 0
+        0.0
+    else
+        intersectLen / unionLen
+
+// Exponential Moving Average helper
+f_ema_update(prevEma, newValue, alpha = 0.2) =>
+    na(prevEma) ? newValue : alpha * newValue + (1 - alpha) * prevEma
+
+// Mini-convolution function (causal)
+f_conv(src, weights) =>
+    result = 0.0
+    weightsSize = array.size(weights)
+    if weightsSize > 0
+        maxIdx = math.min(weightsSize - 1, 5) // Limit convolution window for performance
+        for i = 0 to maxIdx by 1
+            if bar_index >= i
+                result := result + nz(src[i], 0) * array.get(weights, i)
+                result
+    result
+
+// Manual ADX calculation (simplified)
+f_adx(len = 14) =>
+    up = ta.change(high)
+    down = -ta.change(low)
+    trur = ta.rma(ta.tr, len)
+    plus = fixnan(100 * ta.rma(up > down and up > 0 ? up : 0, len) / trur)
+    minus = fixnan(100 * ta.rma(down > up and down > 0 ? down : 0, len) / trur)
+    sum = plus + minus
+    adx = 100 * ta.rma(math.abs(plus - minus) / (sum == 0 ? 1 : sum), len)
+    adx
+
+// Clean up drawing objects
+f_cleanup_lines(linesArray) =>
+    if array.size(linesArray) > 0
+        for i = 0 to array.size(linesArray) - 1 by 1
+            lineObj = array.get(linesArray, i)
+            if not na(lineObj)
+                line.delete(lineObj)
+        array.clear(linesArray)
+
+f_cleanup_labels(labelsArray) =>
+    if array.size(labelsArray) > 0
+        for i = 0 to array.size(labelsArray) - 1 by 1
+            labelObj = array.get(labelsArray, i)
+            if not na(labelObj)
+                label.delete(labelObj)
+        array.clear(labelsArray)
+
+// Clean up linefill objects
+f_cleanup_fills(fillsArray) =>
+    if array.size(fillsArray) > 0
+        for i = 0 to array.size(fillsArray) - 1 by 1
+            fillObj = array.get(fillsArray, i)
+            if not na(fillObj)
+                linefill.delete(fillObj)
+        array.clear(fillsArray)
+
+// ===== SECTION 3: FEATURE CALCULATIONS =====
+
+// ATR calculations
+atr14 = ta.atr(14)
+atr64 = ta.atr(64)
+
+// VWAP calculation
+sessionVWAP = ta.vwap
+
+// Returns calculations
+r1 = bar_index > 0 ? math.log(close / close[1]) : 0.0
+r5 = bar_index >= 5 ? math.log(close / close[5]) : 0.0
+r15 = bar_index >= 15 ? math.log(close / close[15]) : 0.0
+
+// ADX for trend context (using manual calculation)
+adx14 = f_adx(14)
+
+// Volume Z-Score by time-of-day
+var array<float> volMeanByHour = array.new<float>(24, 0.0)
+var array<float> volStdByHour = array.new<float>(24, 1.0)
+var array<int> volCountByHour = array.new<int>(24, 0)
+
+currentHour = hour(time)
+currentVol = volume
+
+// Update volume statistics by hour
+if barstate.isconfirmed
+    currentMean = array.get(volMeanByHour, currentHour)
+    currentStd = array.get(volStdByHour, currentHour)
+    currentCount = array.get(volCountByHour, currentHour)
+
+    newCount = currentCount + 1
+    newMean = currentMean + (currentVol - currentMean) / newCount
+    newVariance = currentCount > 0 ? ((currentCount - 1) * math.pow(currentStd, 2) + math.pow(currentVol - newMean, 2)) / newCount : math.pow(currentVol - newMean, 2)
+    newStd = math.max(currentVol * 0.1, math.sqrt(newVariance)) // Floor to avoid division by zero
+
+    array.set(volMeanByHour, currentHour, newMean)
+    array.set(volStdByHour, currentHour, newStd)
+    array.set(volCountByHour, currentHour, newCount)
+
+volZ = (currentVol - array.get(volMeanByHour, currentHour)) / array.get(volStdByHour, currentHour)
+
+// ===== SECTION 4: PIVOT DETECTION AND BUFFER =====
+
+// Pivot detection (accepts k-bar lag for non-repainting)
+pivotHigh = ta.pivothigh(kLeftRight, kLeftRight)
+pivotLow = ta.pivotlow(kLeftRight, kLeftRight)
+
+// Pivot buffer - separate arrays for each field
+var array<float> pivotPrices = array.new<float>()
+var array<float> pivotStrengths = array.new<float>()
+var array<float> pivotVolZs = array.new<float>()
+var array<int> pivotBarIndices = array.new<int>()
+var array<int> pivotPolarities = array.new<int>() // +1 for support, -1 for resistance
+
+// Calculate pivot strength and add to buffer
+if not na(pivotHigh) and barstate.isconfirmed
+    strength = (pivotHigh - low[kLeftRight]) / atr14 // ATR-normalized excursion
+    array.push(pivotPrices, pivotHigh)
+    array.push(pivotStrengths, strength)
+    array.push(pivotVolZs, volZ[kLeftRight])
+    array.push(pivotBarIndices, bar_index - kLeftRight)
+    array.push(pivotPolarities, -1) // resistance
+
+if not na(pivotLow) and barstate.isconfirmed
+    strength = (high[kLeftRight] - pivotLow) / atr14 // ATR-normalized excursion
+    array.push(pivotPrices, pivotLow)
+    array.push(pivotStrengths, strength)
+    array.push(pivotVolZs, volZ[kLeftRight])
+    array.push(pivotBarIndices, bar_index - kLeftRight)
+    array.push(pivotPolarities, +1) // support
+
+// Maintain buffer size
+if array.size(pivotPrices) > lookbackBars
+    array.shift(pivotPrices)
+    array.shift(pivotStrengths)
+    array.shift(pivotVolZs)
+    array.shift(pivotBarIndices)
+    array.shift(pivotPolarities)
+
+// ===== SECTION 5: BINNING AND CANDIDATE ZONE CREATION =====
+
+// ATR-based binning using map
+binSize = alphaBinATR * atr64
+
+// Bin data: separate maps for bin properties
+var map<int, float> binCenters = map.new<int, float>()
+var map<int, float> binWeightedCounts = map.new<int, float>()
+var map<int, float> binPriceSums = map.new<int, float>()
+var map<int, int> binPriceCounts = map.new<int, int>()
+var map<int, int> binPolarities = map.new<int, int>()
+var int lastProcessedPivotIndex = 0
+
+// Optimized pivot processing - only process a subset of pivots per update
+if barstate.isconfirmed and bar_index % updateFrequency == 0 and array.size(pivotPrices) > 0
+    pivotCount = array.size(pivotPrices)
+
+    // Clear old bins periodically (less frequently)
+    if bar_index % 200 == 0
+        map.clear(binCenters)
+        map.clear(binWeightedCounts)
+        map.clear(binPriceSums)
+        map.clear(binPriceCounts)
+        map.clear(binPolarities)
+        lastProcessedPivotIndex := 0
+        lastProcessedPivotIndex
+
+    // Process only recent pivots or a limited number per update
+    startIdx = math.max(0, pivotCount - maxPivotsPerUpdate)
+    endIdx = pivotCount - 1
+
+    // Process limited number of recent pivots
+    if startIdx <= endIdx
+        for idx = startIdx to endIdx by 1
+            price = array.get(pivotPrices, idx)
+            strength = array.get(pivotStrengths, idx)
+            volZPivot = array.get(pivotVolZs, idx)
+            barIdx = array.get(pivotBarIndices, idx)
+            polarity = array.get(pivotPolarities, idx)
+
+            // Apply recency decay
+            recencyDecay = math.exp(-0.001 * (bar_index - barIdx))
+            weight = strength * math.max(0.1, 1 + volZPivot * 0.1) * recencyDecay
+
+            // Skip very old or weak pivots to save computation
+            if recencyDecay < 0.1 or weight < 0.5
+                continue
+
+            // Map to bin
+            binIndex = int(price / binSize)
+
+            if map.contains(binWeightedCounts, binIndex)
+                currentCount = map.get(binWeightedCounts, binIndex)
+                currentPriceSum = map.get(binPriceSums, binIndex)
+                currentPriceCount = map.get(binPriceCounts, binIndex)
+
+                map.put(binWeightedCounts, binIndex, currentCount + weight)
+                map.put(binPriceSums, binIndex, currentPriceSum + price)
+                map.put(binPriceCounts, binIndex, currentPriceCount + 1)
+            else
+                map.put(binCenters, binIndex, binIndex * binSize)
+                map.put(binWeightedCounts, binIndex, weight)
+                map.put(binPriceSums, binIndex, price)
+                map.put(binPriceCounts, binIndex, 1)
+                map.put(binPolarities, binIndex, polarity)
+
+// ===== SECTION 6: ZONE MANAGER =====
+
+// Zone arrays - separate array for each zone property
+var array<float> zonePriceLows = array.new<float>()
+var array<float> zonePriceHighs = array.new<float>()
+var array<float> zoneScores = array.new<float>()
+var array<int> zonePolarities = array.new<int>()
+var array<int> zoneTouchCounts = array.new<int>()
+var array<float> zonePriorHitRates = array.new<float>()
+var array<int> zoneLastTouchBars = array.new<int>()
+var array<float> zoneCenters = array.new<float>()
+var array<float> zoneHalfWidths = array.new<float>()
+
+// Drawing objects arrays
+var array<line> activeLines = array.new<line>()
+var array<label> activeLabels = array.new<label>()
+var array<linefill> activeFills = array.new<linefill>() // New array for fills
+var bool zonesUpdated = false
+
+// Create zones from bins with sufficient support
+f_create_zones_from_bins() =>
+    zoneCreationCount = 0
+    maxNewZones = 20 // Limit new zones per update
+
+    if map.size(binWeightedCounts) > 0
+        for [binIndex, weightedCount] in binWeightedCounts
+            if zoneCreationCount >= maxNewZones
+                break
+
+            if map.contains(binPriceCounts, binIndex)
+                priceCount = map.get(binPriceCounts, binIndex)
+                polarity = map.get(binPolarities, binIndex)
+                priceSum = map.get(binPriceSums, binIndex)
+
+                if priceCount >= 2 and weightedCount >= 1.5
+                    centerPrice = priceSum / priceCount
+                    halfWidth = math.max(wBaseATR * atr64, binSize * 0.5)
+
+                    // Add zone
+                    array.push(zonePriceLows, centerPrice - halfWidth)
+                    array.push(zonePriceHighs, centerPrice + halfWidth)
+                    array.push(zoneScores, weightedCount)
+                    array.push(zonePolarities, polarity)
+                    array.push(zoneTouchCounts, 0)
+                    array.push(zonePriorHitRates, 0.5)
+                    array.push(zoneLastTouchBars, bar_index)
+                    array.push(zoneCenters, centerPrice)
+                    array.push(zoneHalfWidths, halfWidth)
+
+                    zoneCreationCount := zoneCreationCount + 1
+                    zoneCreationCount
+
+// Simplified merge zones - limit merge operations
+f_merge_zones() =>
+    mergeZoneCount = array.size(zonePriceLows)
+    if mergeZoneCount > 1
+        merged = array.new<bool>()
+        for k = 0 to mergeZoneCount - 1 by 1
+            array.push(merged, false)
+
+        mergeOperations = 0
+        maxMergeOps = 10 // Limit merge operations
+
+        i = 0
+        while i < mergeZoneCount and mergeOperations < maxMergeOps
+            if array.get(merged, i)
+                i := i + 1
+                continue
+
+            a1 = array.get(zonePriceLows, i)
+            a2 = array.get(zonePriceHighs, i)
+            polarityA = array.get(zonePolarities, i)
+
+            j = i + 1
+            while j < mergeZoneCount and mergeOperations < maxMergeOps
+                if array.get(merged, j)
+                    j := j + 1
+                    continue
+
+                b1 = array.get(zonePriceLows, j)
+                b2 = array.get(zonePriceHighs, j)
+                polarityB = array.get(zonePolarities, j)
+
+                // Only merge zones of same polarity
+                if polarityA == polarityB and f_iou1d(a1, a2, b1, b2) > mergeIoU
+                    // Merge j into i
+                    newLow = math.min(a1, b1)
+                    newHigh = math.max(a2, b2)
+                    newCenter = (newLow + newHigh) * 0.5
+                    newHalfWidth = (newHigh - newLow) * 0.5
+                    newScore = array.get(zoneScores, i) + array.get(zoneScores, j)
+                    newTouchCount = array.get(zoneTouchCounts, i) + array.get(zoneTouchCounts, j)
+
+                    array.set(zonePriceLows, i, newLow)
+                    array.set(zonePriceHighs, i, newHigh)
+                    array.set(zoneScores, i, newScore)
+                    array.set(zoneTouchCounts, i, newTouchCount)
+                    array.set(zoneCenters, i, newCenter)
+                    array.set(zoneHalfWidths, i, newHalfWidth)
+
+                    array.set(merged, j, true)
+                    mergeOperations := mergeOperations + 1
+                    mergeOperations
+                j := j + 1
+                j
+            i := i + 1
+            i
+
+        // Remove merged zones (backwards iteration)
+        m = mergeZoneCount - 1
+        while m >= 0
+            if array.get(merged, m)
+                array.remove(zonePriceLows, m)
+                array.remove(zonePriceHighs, m)
+                array.remove(zoneScores, m)
+                array.remove(zonePolarities, m)
+                array.remove(zoneTouchCounts, m)
+                array.remove(zonePriorHitRates, m)
+                array.remove(zoneLastTouchBars, m)
+                array.remove(zoneCenters, m)
+                array.remove(zoneHalfWidths, m)
+            m := m - 1
+            m
+
+// Zone decay and cleanup
+f_decay_zones() =>
+    decayZoneCount = array.size(zonePriceLows)
+    if decayZoneCount > 0
+        // Apply score decay for untouched zones
+        for n = 0 to decayZoneCount - 1 by 1
+            lastTouchBar = array.get(zoneLastTouchBars, n)
+            barsSinceTouch = bar_index - lastTouchBar
+
+            if barsSinceTouch > H
+                currentScore = array.get(zoneScores, n)
+                decayFactor = math.exp(-0.01 * barsSinceTouch)
+                array.set(zoneScores, n, currentScore * decayFactor)
+
+        // Cap number of zones by removing lowest scoring ones
+        while array.size(zonePriceLows) > maxZones
+            lowestScore = array.get(zoneScores, 0)
+            lowestIndex = 0
+
+            for p = 1 to array.size(zoneScores) - 1 by 1
+                score = array.get(zoneScores, p)
+                if score < lowestScore
+                    lowestScore := score
+                    lowestIndex := p
+                    lowestIndex
+
+            // Remove lowest scoring zone
+            array.remove(zonePriceLows, lowestIndex)
+            array.remove(zonePriceHighs, lowestIndex)
+            array.remove(zoneScores, lowestIndex)
+            array.remove(zonePolarities, lowestIndex)
+            array.remove(zoneTouchCounts, lowestIndex)
+            array.remove(zonePriorHitRates, lowestIndex)
+            array.remove(zoneLastTouchBars, lowestIndex)
+            array.remove(zoneCenters, lowestIndex)
+            array.remove(zoneHalfWidths, lowestIndex)
+
+// Update zones with controlled frequency
+if barstate.isconfirmed and bar_index % updateFrequency == 0
+    // Clear old zones first
+    array.clear(zonePriceLows)
+    array.clear(zonePriceHighs)
+    array.clear(zoneScores)
+    array.clear(zonePolarities)
+    array.clear(zoneTouchCounts)
+    array.clear(zonePriorHitRates)
+    array.clear(zoneLastTouchBars)
+    array.clear(zoneCenters)
+    array.clear(zoneHalfWidths)
+
+    f_create_zones_from_bins()
+    f_merge_zones()
+    f_decay_zones()
+    zonesUpdated := true
+    zonesUpdated
+else
+    zonesUpdated := false
+    zonesUpdated
+
+// ===== SECTION 7: TOUCH DETECTION AND REACTION PROBABILITY =====
+
+// Touch detection and reaction probability calculation
+var float currentQ = na
+var int currentTouchCount = na
+var float currentPriorHitRate = na
+var string currentTouchInfo = na
+var float wickPenATR = na
+
+// Mini-conv filters (if enabled)
+var array<float> gradWeights = array.from(-1.0, 0.0, 1.0)
+var array<float> smoothWeights = array.from(0.25, 0.5, 0.25)
+var array<float> dogWeights = array.from(-1.0, -1.0, 2.0, -1.0, -1.0)
+
+gradFilter = enableMiniConvs ? f_conv(r1, gradWeights) : 0.0
+smoothFilter = enableMiniConvs ? f_conv(r1, smoothWeights) : 0.0
+dogFilter = enableMiniConvs ? f_conv(r1, dogWeights) : 0.0
+
+// Reset current touch info each bar
+currentQ := na
+currentTouchCount := na
+currentPriorHitRate := na
+currentTouchInfo := na
+
+// Check for touches on current bar
+touchZoneCount = array.size(zonePriceLows)
+if touchZoneCount > 0
+    currentLow = low
+    currentHigh = high
+    currentClose = close
+
+    for touchIdx = 0 to touchZoneCount - 1 by 1
+        zoneLow = array.get(zonePriceLows, touchIdx)
+        zoneHigh = array.get(zonePriceHighs, touchIdx)
+        polarity = array.get(zonePolarities, touchIdx)
+        center = array.get(zoneCenters, touchIdx)
+        halfWidth = array.get(zoneHalfWidths, touchIdx)
+
+        // Check if current bar touches zone
+        if currentHigh >= zoneLow and currentLow <= zoneHigh
+            // Update touch count and last touch bar
+            touchCount = array.get(zoneTouchCounts, touchIdx) + 1
+            array.set(zoneTouchCounts, touchIdx, touchCount)
+            array.set(zoneLastTouchBars, touchIdx, bar_index)
+
+            // Calculate reaction probability features
+            distATR = math.abs(currentClose - center) / atr64
+            widthATR = halfWidth / atr64
+            vwapDiffATR = math.abs(currentClose - sessionVWAP) / atr64
+            priorHitRate = array.get(zonePriorHitRates, touchIdx)
+
+            // Wick penetration calculation
+            if polarity > 0 // support zone
+                wickPenATR := math.max(0, center - currentLow) / atr64
+                wickPenATR
+            else // resistance zone
+                wickPenATR := math.max(0, currentHigh - center) / atr64
+                wickPenATR
+
+            // Trend flag
+            trendFlag = adx14 > 25 ? -1.0 : 1.0
+
+            // Logistic model calculation
+            z = w0 + w1 * distATR + w2 * widthATR + w3 * volZ + w4 * vwapDiffATR + w5 * math.log(1 + touchCount) + w6 * priorHitRate + w7 * wickPenATR + w8 * trendFlag
+
+            // Add mini-conv features if enabled
+            if enableMiniConvs
+                z := z + wgGrad * gradFilter + wgSmooth * smoothFilter + wgDoG * dogFilter
+                z
+
+            q = f_sigmoid(z)
+
+            // Store for plotting and alerts
+            currentQ := q
+            currentTouchCount := touchCount
+            currentPriorHitRate := priorHitRate
+            currentTouchInfo := str.tostring(polarity > 0 ? 'Support' : 'Resistance') + ' @ ' + str.tostring(center, '#.##') + ' | Q=' + str.tostring(math.round(q * 100)) + '%' + ' | Touches=' + str.tostring(touchCount)
+
+            // Update prior hit rate (simplified - in real implementation would track actual outcomes)
+            if liveStrict
+                // Only update with confirmed historical data
+                // This is a placeholder - real implementation would track MFE/MAE outcomes
+                newHitRate = f_ema_update(priorHitRate, q, 0.1)
+                array.set(zonePriorHitRates, touchIdx, newHitRate)
+
+            break // Only process first touched zone per bar
+
+// ===== SECTION 8: PLOTTING AND VISUALIZATION =====
+
+// Clean up old drawing objects when zones are updated
+if zonesUpdated
+    f_cleanup_lines(activeLines)
+    f_cleanup_labels(activeLabels)
+    f_cleanup_fills(activeFills) // Clean up fills
+
+// Zone visualization - only create new lines when zones are updated or on first bar
+plotZoneCount = array.size(zonePriceLows)
+if plotZoneCount > 0 and (zonesUpdated or barstate.isfirst)
+    // Clean up existing drawing objects first
+    f_cleanup_lines(activeLines)
+    f_cleanup_fills(activeFills)
+
+    for plotIdx = 0 to plotZoneCount - 1 by 1
+        zoneLow = array.get(zonePriceLows, plotIdx)
+        zoneHigh = array.get(zonePriceHighs, plotIdx)
+        score = array.get(zoneScores, plotIdx)
+        polarity = array.get(zonePolarities, plotIdx)
+
+        // Color and visibility logic
+        isSupport = polarity > 0
+        showZone = isSupport and showSupport or not isSupport and showResistance
+
+        if showZone
+            // Calculate opacity based on score for lines
+            lineOpacity = 100 - f_clamp(int(score * 20), 0, 80)
+            lineColor = isSupport ? color.new(color.green, lineOpacity) : color.new(color.red, lineOpacity)
+            
+            // Calculate opacity for fills (more transparent than lines)
+            fillOpacity = 130 - f_clamp(int(score * 10), 0, 90) // More transparent fills
+            fillColor = isSupport ? color.new(color.green, fillOpacity) : color.new(color.red, fillOpacity)
+
+            // Draw zone lines and store them
+            lowLine = line.new(bar_index, zoneLow, bar_index + 50, zoneLow, extend = extend.right, color = lineColor, width = 1, style = line.style_solid)
+            highLine = line.new(bar_index, zoneHigh, bar_index + 50, zoneHigh, extend = extend.right, color = lineColor, width = 1, style = line.style_solid)
+
+            array.push(activeLines, lowLine)
+            array.push(activeLines, highLine)
+
+            // Create fill between lines if enabled
+            if showFills
+                zoneFill = linefill.new(lowLine, highLine, color = fillColor)
+                array.push(activeFills, zoneFill)
+
+// Add labels for touched zones (limit label creation)
+if showLabels and not na(currentQ) and currentQ >= probThreshold
+    touchZoneCount = array.size(zonePriceLows)
+    if touchZoneCount > 0
+        for labelIdx = 0 to touchZoneCount - 1 by 1
+            lastTouchBar = array.get(zoneLastTouchBars, labelIdx)
+            if lastTouchBar == bar_index
+                zoneLow = array.get(zonePriceLows, labelIdx)
+                zoneHigh = array.get(zonePriceHighs, labelIdx)
+                polarity = array.get(zonePolarities, labelIdx)
+                touchCount = array.get(zoneTouchCounts, labelIdx)
+                priorHitRate = array.get(zonePriorHitRates, labelIdx)
+
+                isSupport = polarity > 0
+                showZone = isSupport and showSupport or not isSupport and showResistance
+
+                if showZone
+                    opacity = 100 - f_clamp(int(array.get(zoneScores, labelIdx) * 20), 0, 80)
+                    zoneColor = isSupport ? color.new(color.green, opacity) : color.new(color.red, opacity)
+
+                    labelText = showProbabilities ? 'Q: ' + str.tostring(math.round(currentQ * 100)) + '%' + '\nTouches: ' + str.tostring(touchCount) + '\nHit Rate: ' + str.tostring(math.round(priorHitRate * 100)) + '%' : 'Zone Touch'
+
+                    labelY = isSupport ? zoneLow : zoneHigh
+                    labelStyle = isSupport ? label.style_label_up : label.style_label_down
+
+                    zoneLabel = label.new(bar_index, labelY, labelText, style = labelStyle, color = zoneColor, textcolor = color.white, size = size.small)
+
+                    array.push(activeLabels, zoneLabel)
+                break

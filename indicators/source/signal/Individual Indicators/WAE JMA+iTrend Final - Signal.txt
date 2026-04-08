@@ -1,0 +1,793 @@
+//@version=5
+indicator("WAE + JMA/iTrend Combined Signals v3", shorttitle="WAE+iTrend v3", overlay=false, max_lines_count=500, max_labels_count=500)
+
+//════════════════════════════════════════════════════════════════════════════════
+// DISPLAY OPTIONS
+//════════════════════════════════════════════════════════════════════════════════
+showWAE = input.bool(true, "Show WAE Indicator", group="Display Settings")
+showDirection = input.bool(true, "Show Direction Indicator", group="Display Settings")
+
+//════════════════════════════════════════════════════════════════════════════════
+// WAE SECTION
+//════════════════════════════════════════════════════════════════════════════════
+
+// === JMA Function ===
+jma_func(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jma_val = na
+    e0 := (1 - alpha) * src + alpha * nz(e0[1], src)
+    e1 := (src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jma_val[1], src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jma_val := e2 + nz(jma_val[1], src)
+    jma_val
+
+// === Ehlers Dominant Cycle Function ===
+ehlersDominantCycle(src, minCycle, maxCycle) =>
+    var float smooth = na
+    smooth := (4 * src + 3 * nz(src[1]) + 2 * nz(src[2]) + nz(src[3])) / 10
+
+    var float i1 = 0.0
+    var float q1 = 0.0
+    var float i2 = 0.0
+    var float q2 = 0.0
+    var float re = 0.0
+    var float im = 0.0
+
+    i1 := nz(smooth[3])
+    q1 := (smooth - nz(smooth[6])) / 2.0
+
+    i2 := 0.2 * i1 + 0.8 * nz(i2[1])
+    q2 := 0.2 * q1 + 0.8 * nz(q2[1])
+
+    re := 0.2 * (i2 * nz(i2[1]) + q2 * nz(q2[1])) + 0.8 * nz(re[1])
+    im := 0.2 * (i2 * nz(q2[1]) - q2 * nz(i2[1])) + 0.8 * nz(im[1])
+
+    period = im != 0 and re != 0 ? 2 * math.pi / math.atan(im / re) : 0
+    period := period < minCycle ? minCycle : period > maxCycle ? maxCycle : period
+
+    var float smoothPeriod = na
+    smoothPeriod := 0.33 * period + 0.67 * nz(smoothPeriod[1], period)
+
+    math.round(smoothPeriod)
+
+// === Gaussian Kernel Function ===
+gaussianKernel(x, bandwidth) => math.exp(-math.pow(x, 2) / (bandwidth * bandwidth * 2))
+
+kernelRegression(src, kernelLen) =>
+    sum = 0.0
+    sumw = 0.0
+    for i = 0 to kernelLen - 1
+        weight = gaussianKernel(i, kernelLen)
+        sum += src[i] * weight
+        sumw += weight
+    sumw != 0 ? sum / sumw : na
+
+// === WAE Inputs ===
+sensitivity = input.int(7, title="WAE Sensitivity", group="WAE Settings")
+
+// Ehlers Dominant Cycle Settings
+useAdaptiveCycle = input.bool(true, title="Use Adaptive Cycle (Ehlers)", group="WAE Adaptive Cycle")
+minCycleLength = input.int(5, title="Min Cycle Length", minval=1, group="WAE Adaptive Cycle")
+maxCycleLength = input.int(16, title="Max Cycle Length", minval=1, group="WAE Adaptive Cycle")
+manualCycleLength = input.int(8, title="Manual Cycle Length", minval=1, group="WAE Adaptive Cycle",
+  tooltip="Used when Adaptive Cycle is disabled")
+
+// Volatility JMA (Fast)
+volLength = input.int(title="Volatility JMA Base Length", defval=5, minval=1, group="WAE Volatility JMA (Fast)")
+volPhase = input.int(title="Volatility JMA Phase", defval=50, minval=-100, maxval=100, group="WAE Volatility JMA (Fast)")
+volPower = input.int(title="Volatility JMA Power", defval=2, minval=1, group="WAE Volatility JMA (Fast)")
+volatilityLength = input.int(title="Volatility Period", defval=7, minval=1, group="WAE Volatility JMA (Fast)")
+volCycleMultiplier = input.float(title="Vol Cycle Multiplier", defval=1.0, minval=0.1, maxval=2.0, step=0.1, group="WAE Volatility JMA (Fast)")
+
+// Volume-Weighted JMA (Slow)
+vwjmaLength = input.int(title="VW-JMA Base Length", defval=16, minval=1, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaPhase = input.int(title="VW-JMA Phase", defval=50, minval=-100, maxval=100, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaPower = input.int(title="VW-JMA Power", defval=2, minval=1, group="WAE Volume-Weighted JMA (Slow)")
+minVolumeThreshold = input.float(title="Min Volume Threshold (% of avg)", defval=50.0, minval=0.1, maxval=100, group="WAE Volume-Weighted JMA (Slow)")
+useExtendedHours = input.bool(title="Detect Extended Hours", defval=true, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaSmoothing = input.int(title="VW-JMA Smoothing Period", defval=3, minval=1, maxval=10, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaCycleMultiplier = input.float(title="VW-JMA Cycle Multiplier", defval=1.0, minval=0.1, maxval=2.0, step=0.1, group="WAE Volume-Weighted JMA (Slow)")
+
+// Kernel Band Settings
+kernelLen = input.int(16, title="Kernel Length", minval=2, group="WAE Kernel Bands")
+kernelMult = input.float(1.816, title="Kernel Band Multiplier", minval=0.1, group="WAE Kernel Bands")
+
+// === Calculate Adaptive Cycle Length ===
+dominantCycle = ehlersDominantCycle(close, minCycleLength, maxCycleLength)
+baseCycle = useAdaptiveCycle ? dominantCycle : manualCycleLength
+
+adaptiveVolLength = math.round(baseCycle * volCycleMultiplier)
+adaptiveVWJMALength = math.round(baseCycle * vwjmaCycleMultiplier)
+
+// === DEAD_ZONE calculation ===
+DEAD_ZONE = ta.rma(ta.tr(true), 100) * 3.7
+
+// === VOLATILITY JMA (FAST) ===
+median = ta.median(close, volatilityLength)
+mad = ta.median(math.abs(close - median), volatilityLength)
+volatility = mad * 1.4826
+volatility := na(volatility) or volatility == 0 ? 1 : volatility
+volatilityWeight = volatility / ta.ema(volatility, volatilityLength)
+weightedSrc = close * volatilityWeight
+
+volPhaseRatio = volPhase < -100 ? 0.5 : volPhase > 100 ? 2.5 : volPhase / 100 + 1.5
+volBeta = 0.45 * (adaptiveVolLength - 1) / (0.45 * (adaptiveVolLength - 1) + 2)
+volAlpha = math.pow(volBeta, volPower)
+
+var float vol_e0_vw = 0.0
+vol_e0_vw := (1 - volAlpha) * weightedSrc + volAlpha * vol_e0_vw
+
+var float vol_e1_vw = 0.0
+vol_e1_vw := (weightedSrc - vol_e0_vw) * (1 - volBeta) + volBeta * vol_e1_vw
+
+var float vol_e2_vw = 0.0
+var float vol_jma_vw = 0.0
+vol_e2_vw := (vol_e0_vw + volPhaseRatio * vol_e1_vw - vol_jma_vw) * math.pow(1 - volAlpha, 2) + math.pow(volAlpha, 2) * vol_e2_vw
+vol_jma_vw := vol_e2_vw + vol_jma_vw
+
+var float vol_e0_vol = 0.0
+vol_e0_vol := (1 - volAlpha) * volatilityWeight + volAlpha * vol_e0_vol
+
+var float vol_e1_vol = 0.0
+vol_e1_vol := (volatilityWeight - vol_e0_vol) * (1 - volBeta) + volBeta * vol_e1_vol
+
+var float vol_e2_vol = 0.0
+var float vol_jma_vol = 0.0
+vol_e2_vol := (vol_e0_vol + volPhaseRatio * vol_e1_vol - vol_jma_vol) * math.pow(1 - volAlpha, 2) + math.pow(volAlpha, 2) * vol_e2_vol
+vol_jma_vol := vol_e2_vol + vol_jma_vol
+
+volatilityJMA = vol_jma_vol != 0 ? vol_jma_vw / vol_jma_vol : close
+
+// === CVD CALCULATION ===
+deltaVolume = close > open ? volume : close < open ? -volume : 0
+var float cvd = 0.0
+cvd += deltaVolume
+
+// === CVD-RVWAP JMA (SLOW) ===
+isExtendedHours = useExtendedHours ? not na(time(timeframe.period, "0930-1600", "America/New_York")) == false : false
+
+avgVolume = ta.sma(volume, adaptiveVWJMALength * 2)
+volThreshold = avgVolume * (minVolumeThreshold / 100.0)
+isLowVolume = volume < volThreshold or isExtendedHours
+
+volumeStdev = ta.stdev(volume, adaptiveVWJMALength)
+volumeChange = math.abs(volume - volume[1])
+isErraticVolume = volumeStdev > 0 and volumeChange > (volumeStdev * 3)
+
+useRegularJMA = isLowVolume or isErraticVolume
+
+regularJMA = jma_func(close, adaptiveVWJMALength, vwjmaPhase, vwjmaPower)
+
+cvdPhaseRatio = vwjmaPhase < -100 ? 0.5 : vwjmaPhase > 100 ? 2.5 : vwjmaPhase / 100 + 1.5
+cvdBeta = 0.45 * (adaptiveVWJMALength - 1) / (0.45 * (adaptiveVWJMALength - 1) + 2)
+cvdAlpha = math.pow(cvdBeta, vwjmaPower)
+
+maxVolume = avgVolume * 5
+minVolume = avgVolume * 0.1
+clampedVolume = math.max(minVolume, math.min(volume, maxVolume))
+
+normalizedVolume = clampedVolume > 0 ? clampedVolume : 1.0
+cvdWeight = cvd != 0 ? (1 + (deltaVolume / math.max(math.abs(cvd), volume))) : 1.0
+cvdWeightedVolume = normalizedVolume * cvdWeight
+
+rvwapPrice = close * cvdWeightedVolume
+smoothVol = cvdWeightedVolume
+
+var float cvd_e0_vw = 0.0
+cvd_e0_vw := (1 - cvdAlpha) * rvwapPrice + cvdAlpha * cvd_e0_vw
+
+var float cvd_e1_vw = 0.0
+cvd_e1_vw := (rvwapPrice - cvd_e0_vw) * (1 - cvdBeta) + cvdBeta * cvd_e1_vw
+
+var float cvd_e2_vw = 0.0
+var float cvd_jma_numerator = 0.0
+cvd_e2_vw := (cvd_e0_vw + cvdPhaseRatio * cvd_e1_vw - cvd_jma_numerator) * math.pow(1 - cvdAlpha, 2) + math.pow(cvdAlpha, 2) * cvd_e2_vw
+cvd_jma_numerator := cvd_e2_vw + cvd_jma_numerator
+
+var float cvd_e0_vol = 0.0
+cvd_e0_vol := (1 - cvdAlpha) * smoothVol + cvdAlpha * cvd_e0_vol
+
+var float cvd_e1_vol = 0.0
+cvd_e1_vol := (smoothVol - cvd_e0_vol) * (1 - cvdBeta) + cvdBeta * cvd_e1_vol
+
+var float cvd_e2_vol = 0.0
+var float cvd_jma_denominator = 0.0
+cvd_e2_vol := (cvd_e0_vol + cvdPhaseRatio * cvd_e1_vol - cvd_jma_denominator) * math.pow(1 - cvdAlpha, 2) + math.pow(cvdAlpha, 2) * cvd_e2_vol
+cvd_jma_denominator := cvd_e2_vol + cvd_jma_denominator
+
+cvdRVWAPJMA_raw = cvd_jma_denominator != 0 ? cvd_jma_numerator / cvd_jma_denominator : close
+
+priceDeviation = math.abs(cvdRVWAPJMA_raw - close) / close
+isTooDeviated = priceDeviation > 0.05
+
+var float lastValidCVDRVWAP = na
+if not useRegularJMA and not isTooDeviated and not na(cvdRVWAPJMA_raw)
+    lastValidCVDRVWAP := cvdRVWAPJMA_raw
+
+cvdRVWAPJMA_temp = (useRegularJMA or isTooDeviated) ? regularJMA : cvdRVWAPJMA_raw
+
+smoothingAlpha = 2.0 / (vwjmaSmoothing + 1)
+var float cvdRVWAPJMA = na
+cvdRVWAPJMA := na(cvdRVWAPJMA) ? cvdRVWAPJMA_temp :
+  smoothingAlpha * cvdRVWAPJMA_temp + (1 - smoothingAlpha) * cvdRVWAPJMA
+
+if useRegularJMA
+    extraSmoothing = 2.0 / (vwjmaSmoothing * 2 + 1)
+    cvdRVWAPJMA := extraSmoothing * cvdRVWAPJMA_temp + (1 - extraSmoothing) * cvdRVWAPJMA
+
+// === MACD ===
+macd_value = volatilityJMA - cvdRVWAPJMA
+macd_value_prev = volatilityJMA[1] - cvdRVWAPJMA[1]
+t1 = (macd_value - macd_value_prev) * sensitivity
+
+// === Kernel Bands (Gaussian only) ===
+kr_mean = kernelRegression(close, kernelLen)
+kr_dev = 0.0
+sumw = 0.0
+for i = 0 to kernelLen - 1
+    weight = gaussianKernel(i, kernelLen)
+    kr_dev += math.abs(close[i] - kr_mean) * weight
+    sumw += weight
+kr_dev := sumw != 0 ? kr_dev / sumw : na
+
+kr_upper = kr_mean + kernelMult * kr_dev
+kr_lower = kr_mean - kernelMult * kr_dev
+e1_val = kr_upper - kr_lower
+
+// === Trend determination ===
+trendUp = (t1 >= 0) ? t1 : 0
+trendDown = (t1 < 0) ? -t1 : 0
+
+//════════════════════════════════════════════════════════════════════════════════
+// JMA/iTREND DIRECTION BIAS
+//════════════════════════════════════════════════════════════════════════════════
+
+// --- Inputs ---
+dir_src = input.source(close, "Direction Source", group="Direction Bias (JMA/iTrend)")
+dir_jma_len = input.int(16, "Direction JMA Length", minval=1, group="Direction Bias (JMA/iTrend)",
+  tooltip="Static length when adaptive cycle is off. When on, this is overridden by cycle.")
+dir_jma_phase = input.float(100, "Direction JMA Phase", minval=-100, maxval=100, group="Direction Bias (JMA/iTrend)")
+dir_jma_power = input.float(3.5, "Direction JMA Power", minval=1, step=0.1, group="Direction Bias (JMA/iTrend)")
+dir_itrend_alpha = input.float(0.09, "Direction iTrend Alpha", step=0.01, group="Direction Bias (JMA/iTrend)",
+  tooltip="Match your trailing stop's iTrend alpha for consistency")
+dir_accel_len = input.int(2, "Acceleration Smooth", minval=1, group="Direction Bias (JMA/iTrend)")
+dir_slope_len = input.int(2, "Slope Lookback", minval=1, group="Direction Bias (JMA/iTrend)")
+
+// Cycle-adaptive length
+dir_use_cycle = input.bool(true, "Use Adaptive Cycle for Direction JMA", group="Direction Bias (JMA/iTrend)",
+  tooltip="Taps into the same Ehlers cycle as WAE")
+dir_cycle_mult = input.float(1.0, "Direction Cycle Multiplier", minval=0.1, maxval=3.0, step=0.1,
+  group="Direction Bias (JMA/iTrend)")
+dir_use_half_cycle = input.bool(true, "Use Half Cycle", group="Direction Bias (JMA/iTrend)")
+
+// Signal mode
+dir_signal_mode = input.string("Both", "Direction Signal Type",
+  options=["iTrend Zero Cross", "Acceleration Flip", "Both"],
+  group="Direction Bias (JMA/iTrend)")
+
+// State-based entry/exit strictness
+dir_entry_states = input.string("Strong + Weak Up", "Entry Allowed In States",
+  options=["Strong Up Only", "Strong + Weak Up", "Any Bullish (incl. Slowing)"],
+  group="Direction Bias (JMA/iTrend)")
+dir_exit_states = input.string("Down + Slowing", "Exit Allowed In States",
+  options=["Down Only", "Down + Slowing", "Any Bearish (incl. Weak Up)"],
+  group="Direction Bias (JMA/iTrend)")
+
+// --- Caution System Inputs ---
+caution_mild_thresh = input.float(25.0, "Mild Caution Threshold", minval=5, maxval=50, step=5,
+  group="Caution System",
+  tooltip="Caution score above this = mild caution (yellow)")
+caution_strong_thresh = input.float(50.0, "Strong Caution Threshold", minval=25, maxval=80, step=5,
+  group="Caution System",
+  tooltip="Caution score above this = strong caution (orange)")
+caution_critical_thresh = input.float(75.0, "Critical Caution Threshold", minval=50, maxval=100, step=5,
+  group="Caution System",
+  tooltip="Caution score above this = critical (near exit)")
+
+// Caution component weights
+w_caution_dir = input.float(40.0, "Direction State Weight %", minval=0, maxval=100, step=5,
+  group="Caution System",
+  tooltip="How much the JMA/iTrend state contributes to caution score")
+w_caution_wae = input.float(30.0, "WAE Momentum Weight %", minval=0, maxval=100, step=5,
+  group="Caution System",
+  tooltip="How much WAE energy quality contributes to caution score")
+w_caution_ext = input.float(30.0, "Extension Weight %", minval=0, maxval=100, step=5,
+  group="Caution System",
+  tooltip="How much price extension (Kernel + MAD) contributes to caution score")
+
+// Extension detection settings
+ext_mad_len = input.int(14, "Extension MAD Length", minval=5, group="Caution System",
+  tooltip="Lookback for MAD-based statistical extension detection")
+ext_mad_mult = input.float(2.0, "Extension MAD Multiplier", minval=0.5, maxval=5.0, step=0.1,
+  group="Caution System",
+  tooltip="How many MADs from median = fully extended")
+ext_kernel_weight = input.float(0.5, "Kernel vs MAD Blend", minval=0.0, maxval=1.0, step=0.1,
+  group="Caution System",
+  tooltip="0 = pure MAD extension, 1 = pure Kernel extension, 0.5 = equal blend")
+
+// --- Visual Toggles ---
+showSlopeLine = input.bool(true, "Show Direction Slope Line", group="Direction Visuals")
+showStateBars = input.bool(true, "Show State Heatmap Bars", group="Direction Visuals")
+showDirSignals = input.bool(true, "Show Direction Signals", group="Direction Visuals")
+showStateZones = input.bool(true, "Show State Zones (Background)", group="Direction Visuals")
+showStateDash = input.bool(true, "Show State Dashboard", group="Direction Visuals")
+showCautionDash = input.bool(true, "Show Caution Dashboard", group="Direction Visuals")
+
+dir_label_size = input.string("Small", "Direction Label Size",
+  options=["Tiny", "Small", "Normal", "Large"], group="Direction Visuals")
+
+// State colors
+col_dir_strong_up = input.color(color.new(color.lime, 0), "Strong Up Color", group="Direction Visuals")
+col_dir_weak_up = input.color(color.new(color.yellow, 0), "Weak Up Color", group="Direction Visuals")
+col_dir_slowing_dn = input.color(color.new(color.aqua, 0), "Slowing Down Color", group="Direction Visuals")
+col_dir_down = input.color(color.new(color.red, 0), "Down Color", group="Direction Visuals")
+col_dir_itrend_bull = input.color(color.new(color.green, 30), "iTrend Early Bull", group="Direction Visuals")
+col_dir_itrend_bear = input.color(color.new(color.orange, 30), "iTrend Early Bear", group="Direction Visuals")
+
+// Combined signal background colors
+col_combined_entry = input.color(color.new(color.green, 75), "Combined Entry Background", group="Direction Visuals")
+col_combined_caution_mild = input.color(color.new(color.yellow, 80), "Mild Caution Background", group="Direction Visuals")
+col_combined_caution_strong = input.color(color.new(color.orange, 75), "Strong Caution Background", group="Direction Visuals")
+col_combined_caution_critical = input.color(color.new(#FF4500, 70), "Critical Caution Background", group="Direction Visuals")
+col_combined_exit = input.color(color.new(color.red, 75), "Combined Exit Background", group="Direction Visuals")
+
+// --- Calculate adaptive direction JMA length ---
+float dir_adaptive_len = dir_jma_len
+if dir_use_cycle
+    float raw_len = baseCycle * dir_cycle_mult
+    if dir_use_half_cycle
+        raw_len := raw_len / 2.0
+    dir_adaptive_len := math.max(4, math.round(raw_len))
+
+// --- Direction JMA (dedicated instance) ---
+dir_jma(src, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+
+    var float d_ma1 = na
+    var float d_ma2 = na
+    var float d_det = na
+    var float d_jma = na
+
+    d_ma1 := alpha * src + (1 - alpha) * nz(d_ma1[1], src)
+    d_det := (src - d_ma1) * (1 - beta) + beta * nz(d_det[1])
+    d_ma2 := d_ma1 + phaseRatio * d_det
+    d_jma := d_ma2
+    d_jma
+
+dir_jma_line = dir_jma(dir_src, dir_adaptive_len, dir_jma_phase, dir_jma_power)
+
+// --- Direction iTrend ---
+dir_iTrend_func(src, alpha) =>
+    var float dit = na
+    dit := (alpha - (alpha * alpha) / 4) * src +
+      0.5 * alpha * alpha * nz(src[1]) -
+      (alpha - 0.75 * alpha * alpha) * nz(src[2]) +
+      2 * (1 - alpha) * nz(dit[1]) -
+      (1 - alpha) * (1 - alpha) * nz(dit[2])
+    dit
+
+dir_iTrend = dir_iTrend_func(dir_src, dir_itrend_alpha)
+dir_iTrend_cross = ta.cross(dir_iTrend, 0)
+dir_iTrend_cross_up = ta.crossover(dir_iTrend, 0)
+dir_iTrend_cross_dn = ta.crossunder(dir_iTrend, 0)
+
+// --- State Machine ---
+dir_slope_raw = dir_jma_line - dir_jma_line[dir_slope_len]
+dir_accel_raw = dir_slope_raw - dir_slope_raw[1]
+dir_accel = ta.ema(dir_accel_raw, dir_accel_len)
+
+dir_slope_pos = dir_slope_raw > 0
+dir_slope_neg = dir_slope_raw < 0
+dir_accel_pos = dir_accel > 0
+dir_accel_neg = dir_accel < 0
+
+dir_strong_up = dir_slope_pos and dir_accel_pos
+dir_weak_up = dir_slope_pos and dir_accel_neg
+dir_slowing_dn = dir_slope_neg and dir_accel_pos
+dir_down = dir_slope_neg and dir_accel_neg
+
+dir_weakening = dir_accel < 0 or math.abs(dir_slope_raw) < math.abs(dir_slope_raw[1])
+dir_iTrend_early = dir_iTrend_cross and dir_weakening
+dir_iTrend_early_bull = dir_iTrend_early and dir_iTrend > 0
+dir_iTrend_early_bear = dir_iTrend_early and dir_iTrend < 0
+
+// --- Signal Logic ---
+dir_itrend_buy = dir_iTrend_cross_up
+dir_itrend_sell = dir_iTrend_cross_dn
+
+dir_accel_flip_up = dir_accel_pos and not dir_accel_pos[1]
+dir_accel_flip_dn = dir_accel_neg and not dir_accel_neg[1]
+
+dir_signal_buy = (dir_signal_mode == "iTrend Zero Cross" and dir_itrend_buy) or
+  (dir_signal_mode == "Acceleration Flip" and dir_accel_flip_up) or
+  (dir_signal_mode == "Both" and (dir_itrend_buy or dir_accel_flip_up))
+
+dir_signal_sell = (dir_signal_mode == "iTrend Zero Cross" and dir_itrend_sell) or
+  (dir_signal_mode == "Acceleration Flip" and dir_accel_flip_dn) or
+  (dir_signal_mode == "Both" and (dir_itrend_sell or dir_accel_flip_dn))
+
+// --- Trade State ---
+dir_entry_zone = (dir_entry_states == "Strong Up Only" and dir_strong_up) or
+  (dir_entry_states == "Strong + Weak Up" and (dir_strong_up or dir_weak_up)) or
+  (dir_entry_states == "Any Bullish (incl. Slowing)" and (dir_strong_up or dir_weak_up or dir_slowing_dn))
+
+dir_exit_zone = (dir_exit_states == "Down Only" and dir_down) or
+  (dir_exit_states == "Down + Slowing" and (dir_down or dir_slowing_dn)) or
+  (dir_exit_states == "Any Bearish (incl. Weak Up)" and (dir_down or dir_slowing_dn or dir_weak_up))
+
+var int dir_trade_state = 0
+if dir_strong_up
+    dir_trade_state := 2
+else if dir_weak_up
+    dir_trade_state := 1
+else if dir_slowing_dn
+    dir_trade_state := -1
+else if dir_down
+    dir_trade_state := -2
+
+if dir_iTrend_early_bull
+    dir_trade_state := 1
+else if dir_iTrend_early_bear
+    dir_trade_state := -1
+
+dir_state_color = dir_iTrend_early_bull ? col_dir_itrend_bull :
+  dir_iTrend_early_bear ? col_dir_itrend_bear :
+  dir_strong_up ? col_dir_strong_up :
+  dir_weak_up ? col_dir_weak_up :
+  dir_slowing_dn ? col_dir_slowing_dn :
+  col_dir_down
+
+dir_state_name = dir_iTrend_early_bull ? "iTrend ↑" :
+  dir_iTrend_early_bear ? "iTrend ↓" :
+  dir_strong_up ? "STRONG UP" :
+  dir_weak_up ? "WEAK UP" :
+  dir_slowing_dn ? "SLOWING" :
+  "DOWN"
+
+//════════════════════════════════════════════════════════════════════════════════
+// CAUTION SCORING SYSTEM
+//════════════════════════════════════════════════════════════════════════════════
+
+// Normalize weights
+float total_caution_w = w_caution_dir + w_caution_wae + w_caution_ext
+float cw_dir = total_caution_w > 0 ? w_caution_dir / total_caution_w : 0.333
+float cw_wae = total_caution_w > 0 ? w_caution_wae / total_caution_w : 0.333
+float cw_ext = total_caution_w > 0 ? w_caution_ext / total_caution_w : 0.333
+
+// ── Component 1: Direction State Quality (0 = no caution, 100 = max caution) ──
+//
+// Strong Up         → 0   (no risk from direction)
+// Weak Up           → 30  (decelerating — some risk)
+// iTrend Early Bull → 20  (transition detected, mild risk)
+// iTrend Early Bear → 70  (inflection against — significant risk)
+// Slowing Down      → 60  (trend damaged)
+// Down              → 100 (full directional risk)
+
+float caution_dir = dir_iTrend_early_bull ? 20.0 :
+  dir_iTrend_early_bear ? 70.0 :
+  dir_strong_up ? 0.0 :
+  dir_weak_up ? 30.0 :
+  dir_slowing_dn ? 60.0 :
+  100.0
+
+// ── Component 2: WAE Momentum Quality (0 = no caution, 100 = max caution) ──
+//
+// Measures:
+// a) Is WAE energy fading? (shrinking bars even if above dead zone)
+// b) How far above dead zone? (barely above = risky)
+// c) Is WAE crossing from up to down?
+
+// Energy fade: current trendUp vs recent peak
+float wae_peak = ta.highest(trendUp, 10)
+float wae_fade_ratio = wae_peak > 0 ? trendUp / wae_peak : 1.0
+// 1.0 = at peak (no fade), 0.0 = fully faded
+float caution_wae_fade = (1.0 - wae_fade_ratio) * 60.0
+
+// Dead zone proximity: how far above dead zone (0-1 normalized)
+float dz_headroom = DEAD_ZONE > 0 ? (math.max(trendUp, trendDown) - DEAD_ZONE) / DEAD_ZONE : 0.0
+float caution_wae_dz = dz_headroom < 0.5 ? (1.0 - dz_headroom * 2.0) * 40.0 : 0.0
+
+// WAE direction conflict: trendDown gaining while trendUp still active
+float wae_conflict = trendUp > 0 and trendDown > 0 ? 30.0 : 0.0
+
+float caution_wae = math.min(100.0, caution_wae_fade + caution_wae_dz + wae_conflict)
+
+// ── Component 3: Price Extension (Kernel + MAD dual-layer) ──
+//
+// Kernel extension: how far price is from kernel mean relative to kernel band width
+float kernel_band_width = nz(kr_upper - kr_lower, 1.0)
+float kernel_extension = kernel_band_width > 0 ?
+  math.abs(close - kr_mean) / (kernel_band_width * 0.5) : 0.0
+// 0 = at mean, 1 = at band edge, >1 = outside bands
+float caution_kernel = math.min(100.0, math.max(0.0, (kernel_extension - 0.5) * 200.0))
+// Starts contributing at 50% to band, full caution at 100%+ (outside)
+
+// MAD extension: how far price is from median in MAD units
+float ext_median = ta.median(close, ext_mad_len)
+float ext_mad_sum = 0.0
+for i = 0 to ext_mad_len - 1
+    ext_mad_sum += math.abs(close[i] - ext_median)
+float ext_mad_val = ext_mad_sum / ext_mad_len
+float mad_extension = ext_mad_val > 0 ?
+  math.abs(close - ext_median) / (ext_mad_val * ext_mad_mult) : 0.0
+// 0 = at median, 1 = at MAD band, >1 = outside
+float caution_mad = math.min(100.0, math.max(0.0, (mad_extension - 0.5) * 200.0))
+
+// Blend kernel and MAD extension
+float caution_ext = caution_kernel * ext_kernel_weight + caution_mad * (1.0 - ext_kernel_weight)
+
+// ── Final Caution Score ──
+float caution_score = (caution_dir * cw_dir) + (caution_wae * cw_wae) + (caution_ext * cw_ext)
+caution_score := math.max(0.0, math.min(100.0, caution_score))
+
+// Caution level
+string caution_level = caution_score >= caution_critical_thresh ? "CRITICAL" :
+  caution_score >= caution_strong_thresh ? "STRONG" :
+  caution_score >= caution_mild_thresh ? "MILD" :
+  "NONE"
+
+bool is_caution_mild = caution_score >= caution_mild_thresh and caution_score < caution_strong_thresh
+bool is_caution_strong = caution_score >= caution_strong_thresh and caution_score < caution_critical_thresh
+bool is_caution_critical = caution_score >= caution_critical_thresh
+
+//════════════════════════════════════════════════════════════════════════════════
+// COMBINED SIGNAL LOGIC
+//════════════════════════════════════════════════════════════════════════════════
+
+// Entry: WAE up above dead zone + direction allows + caution not critical
+combinedEntrySignal = trendUp > DEAD_ZONE and dir_entry_zone and not is_caution_critical
+
+// Exit: WAE down above dead zone + direction allows exit
+combinedExitSignal = trendDown > DEAD_ZONE and dir_exit_zone and e1_val > DEAD_ZONE
+
+// Caution: WAE active but caution system flagging risk
+bool combinedCautionMild = trendUp > DEAD_ZONE and is_caution_mild and not dir_exit_zone
+bool combinedCautionStrong = trendUp > DEAD_ZONE and is_caution_strong and not dir_exit_zone
+bool combinedCautionCritical = trendUp > DEAD_ZONE and is_caution_critical
+
+//════════════════════════════════════════════════════════════════════════════════
+// PLOTS - WAE SECTION
+//════════════════════════════════════════════════════════════════════════════════
+
+plot(showWAE ? trendUp : na, style=plot.style_columns, linewidth=1,
+  color=(trendUp < trendUp[1]) ? color.new(color.lime, 45) : color.new(color.green, 45),
+  title="WAE UpTrend")
+plot(showWAE ? trendDown : na, style=plot.style_columns, linewidth=1,
+  color=(trendDown < trendDown[1]) ? color.new(color.orange, 45) : color.new(color.red, 45),
+  title="WAE DownTrend")
+plot(showWAE ? e1_val : na, style=plot.style_line, linewidth=2, color=#A0522D, title="WAE ExplosionLine")
+plot(showWAE ? DEAD_ZONE : na, color=color.blue, linewidth=1, style=plot.style_cross, title="WAE DeadZoneLine")
+
+//════════════════════════════════════════════════════════════════════════════════
+// PLOTS - DIRECTION SECTION
+//════════════════════════════════════════════════════════════════════════════════
+
+waeMax = math.max(ta.highest(trendUp, 100), ta.highest(trendDown, 100), ta.highest(e1_val, 100), DEAD_ZONE)
+dir_slope_max = math.max(math.abs(ta.highest(dir_slope_raw, 100)), math.abs(ta.lowest(dir_slope_raw, 100)))
+dirScaleFactor = dir_slope_max > 0 ? (waeMax * 0.5) / dir_slope_max : 1
+
+scaledSlope = showDirection ? dir_slope_raw * dirScaleFactor : na
+
+plot(showDirection and showSlopeLine ? scaledSlope : na,
+  "Direction Slope (JMA/iTrend)", color=dir_state_color, linewidth=2)
+
+plot(showDirection and showStateBars ? scaledSlope : na,
+  "Direction State Heatmap", style=plot.style_columns, color=color.new(dir_state_color, 40))
+
+hline(0, "Zero Line", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+
+dir_lbl_size = dir_label_size == "Tiny" ? size.tiny :
+  dir_label_size == "Small" ? size.small :
+  dir_label_size == "Normal" ? size.normal :
+  size.large
+
+if showDirection and showDirSignals and dir_signal_buy
+    lbl_color = dir_iTrend_early_bull ? col_dir_itrend_bull : col_dir_strong_up
+    lbl_text = dir_itrend_buy ? "iTrend ↑" : "Accel ↑"
+    label.new(bar_index, scaledSlope, lbl_text,
+      style=label.style_label_up,
+      color=lbl_color,
+      textcolor=color.white,
+      size=dir_lbl_size)
+
+if showDirection and showDirSignals and dir_signal_sell
+    lbl_color = dir_iTrend_early_bear ? col_dir_itrend_bear : col_dir_down
+    lbl_text = dir_itrend_sell ? "iTrend ↓" : "Accel ↓"
+    label.new(bar_index, scaledSlope, lbl_text,
+      style=label.style_label_down,
+      color=lbl_color,
+      textcolor=color.white,
+      size=dir_lbl_size)
+
+//════════════════════════════════════════════════════════════════════════════════
+// STATE DASHBOARD
+//════════════════════════════════  ═══════════════════════════════════════════════
+
+if showStateDash and barstate.islast
+    var table state_table = table.new(position.top_right, 2, 5,
+      border_width=1,
+      border_color=color.new(color.gray, 50),
+      frame_width=1,
+      frame_color=color.new(color.gray, 70))
+
+    table.cell(state_table, 0, 0, "DIR", text_color=color.white,
+      bgcolor=color.new(color.gray, 30), text_size=size.normal)
+    table.cell(state_table, 1, 0, "BIAS", text_color=color.white,
+      bgcolor=color.new(color.gray, 30), text_size=size.normal)
+
+    table.cell(state_table, 0, 1, "State", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(state_table, 1, 1, dir_state_name, text_color=color.black,
+      bgcolor=dir_state_color, text_size=size.normal)
+
+    table.cell(state_table, 0, 2, "JMA Len", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(state_table, 1, 2, str.tostring(dir_adaptive_len, "#"),
+      text_color=color.white,
+      bgcolor=color.new(color.blue, 40), text_size=size.normal)
+
+    string entry_text = dir_entry_zone ? "OPEN" : "BLOCKED"
+    color entry_color = dir_entry_zone ? color.green : color.red
+    table.cell(state_table, 0, 3, "Entry", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(state_table, 1, 3, entry_text, text_color=color.white,
+      bgcolor=entry_color, text_size=size.normal)
+
+    string combo_text = combinedEntrySignal ? "🟢 GO" :
+      combinedCautionCritical ? "🔴 CRIT" :
+      combinedCautionStrong ? "🟠 STRONG" :
+      combinedCautionMild ? "🟡 MILD" :
+      combinedExitSignal ? "🔴 EXIT" : "—"
+    color combo_color = combinedEntrySignal ? color.green :
+      combinedCautionCritical ? #FF4500 :
+      combinedCautionStrong ? color.orange :
+      combinedCautionMild ? color.yellow :
+      combinedExitSignal ? color.red :
+      color.gray
+    table.cell(state_table, 0, 4, "Signal", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(state_table, 1, 4, combo_text, text_color=color.white,
+      bgcolor=combo_color, text_size=size.normal)
+
+//════════════════════════════════════════════════════════════════════════════════
+// CAUTION DASHBOARD
+//════════════════════════════════════════════════════════════════════════════════
+
+if showCautionDash and barstate.islast
+    var table caution_table = table.new(position.top_left, 2, 6,
+      border_width=1,
+      border_color=color.new(color.gray, 50),
+      frame_width=1,
+      frame_color=color.new(color.gray, 70))
+
+    // Header
+    table.cell(caution_table, 0, 0, "CAUTION", text_color=color.white,
+      bgcolor=color.new(color.gray, 30), text_size=size.normal)
+    table.cell(caution_table, 1, 0, "SCORE", text_color=color.white,
+      bgcolor=color.new(color.gray, 30), text_size=size.normal)
+
+    // Total score
+    color score_color = caution_score >= caution_critical_thresh ? #FF4500 :
+      caution_score >= caution_strong_thresh ? color.orange :
+      caution_score >= caution_mild_thresh ? color.yellow :
+      color.green
+    table.cell(caution_table, 0, 1, caution_level, text_color=color.black,
+      bgcolor=score_color, text_size=size.normal)
+    table.cell(caution_table, 1, 1, str.tostring(caution_score, "#") + "%",
+      text_color=color.white,
+      bgcolor=color.new(color.gray, 50), text_size=size.large)
+
+    // Direction component
+    color dir_comp_color = caution_dir > 60 ? color.red : caution_dir > 30 ? color.yellow : color.green
+    table.cell(caution_table, 0, 2, "Direction", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(caution_table, 1, 2, str.tostring(caution_dir, "#"),
+      text_color=color.white, bgcolor=dir_comp_color, text_size=size.small)
+
+    // WAE component
+    color wae_comp_color = caution_wae > 60 ? color.red : caution_wae > 30 ? color.yellow : color.green
+    table.cell(caution_table, 0, 3, "WAE Mom", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(caution_table, 1, 3, str.tostring(caution_wae, "#"),
+      text_color=color.white, bgcolor=wae_comp_color, text_size=size.small)
+
+    // Extension component
+    color ext_comp_color = caution_ext > 60 ? color.red : caution_ext > 30 ? color.yellow : color.green
+    table.cell(caution_table, 0, 4, "Extension", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(caution_table, 1, 4, str.tostring(caution_ext, "#"),
+      text_color=color.white, bgcolor=ext_comp_color, text_size=size.small)
+
+    // Band detail
+    string band_text = "K:" + str.tostring(kernel_extension, "#.##") +
+      " M:" + str.tostring(mad_extension, "#.##")
+    table.cell(caution_table, 0, 5, "Bands", text_color=color.white,
+      bgcolor=color.new(color.gray, 70), text_size=size.tiny)
+    table.cell(caution_table, 1, 5, band_text,
+      text_color=color.white,
+      bgcolor=color.new(color.gray, 60), text_size=size.tiny)
+
+//════════════════════════════════════════════════════════════════════════════════
+// BACKGROUND COLORS
+//════════════════════════════════════════════════════════════════════════════════
+
+// State zones
+state_zone_color = not showStateZones ? na :
+  dir_trade_state == 2 ? color.new(col_dir_strong_up, 90) :
+  dir_trade_state == 1 ? color.new(col_dir_weak_up, 92) :
+  dir_trade_state == -1 ? color.new(col_dir_slowing_dn, 92) :
+  dir_trade_state == -2 ? color.new(col_dir_down, 92) :
+  na
+bgcolor(state_zone_color, title="Direction State Zones")
+
+// WAE data quality
+bgcolor(useRegularJMA ? color.new(color.orange, 90) : na, title="WAE Regular JMA Mode")
+bgcolor(isExtendedHours ? color.new(color.purple, 95) : na, title="WAE Extended Hours")
+
+// Combined signals — graduated caution backgrounds
+bgcolor(combinedEntrySignal ? col_combined_entry : na,
+  title="🟢 COMBINED ENTRY")
+bgcolor(combinedCautionMild ? col_combined_caution_mild : na,
+  title="🟡 MILD CAUTION")
+bgcolor(combinedCautionStrong ? col_combined_caution_strong : na,
+  title="🟠 STRONG CAUTION")
+bgcolor(combinedCautionCritical ? col_combined_caution_critical : na,
+  title="🔴 CRITICAL CAUTION")
+bgcolor(combinedExitSignal ? col_combined_exit : na,
+  title="🔴 COMBINED EXIT")
+
+//════════════════════════════════════════════════════════════════════════════════
+// ALERTS
+//════════════════════════════════════════════════════════════════════════════════
+
+alertcondition(combinedEntrySignal, title="🟢 Combined Entry Signal",
+  message="WAE Uptrend > Dead Zone + Direction Entry Zone + Caution Clear")
+alertcondition(combinedExitSignal, title="🔴 Combined Exit Signal",
+  message="WAE Downtrend > Dead Zone + Direction Exit Zone")
+alertcondition(combinedCautionMild, title="🟡 Mild Caution",
+  message="WAE active but caution score elevated (Mild)")
+alertcondition(combinedCautionStrong, title="🟠 Strong Caution",
+  message="WAE active but caution score high (Strong)")
+alertcondition(combinedCautionCritical, title="🔴 Critical Caution",
+  message="WAE active but caution score critical — entry blocked")
+
+alertcondition(dir_signal_buy, title="Direction Buy Signal",
+  message="JMA/iTrend BUY signal")
+alertcondition(dir_signal_sell, title="Direction Sell Signal",
+  message="JMA/iTrend SELL signal")
+alertcondition(dir_iTrend_early_bull, title="iTrend Early Bullish",
+  message="iTrend crossed zero bullish while JMA weakening")
+alertcondition(dir_iTrend_early_bear, title="iTrend Early Bearish",
+  message="iTrend crossed zero bearish while JMA weakening")
+
+//════════════════════════════════════════════════════════════════════════════════
+// HIDDEN OUTPUTS
+//════════════════════════════════════════════════════════════════════════════════
+
+plot(dir_signal_buy ? 1 : 0, "Direction Buy Signal", display=display.none)
+plot(dir_signal_sell ? 1 : 0, "Direction Sell Signal", display=display.none)
+plot(math.abs(dir_slope_raw), "Direction Slope Magnitude", display=display.none)
+plot(dir_trade_state, "Direction Trade State", display=display.none)
+plot(dir_accel, "Direction Acceleration", display=display.none)
+plot(dir_iTrend, "Direction iTrend Value", display=display.none)
+plot(dir_adaptive_len, "Direction JMA Length", display=display.none)
+
+plot(caution_score, "Caution Score", display=display.none)
+plot(caution_dir, "Caution: Direction", display=display.none)
+plot(caution_wae, "Caution: WAE Momentum", display=display.none)
+plot(caution_ext, "Caution: Extension", display=display.none)
+plot(kernel_extension, "Kernel Extension Ratio", display=display.none)
+plot(mad_extension, "MAD Extension Ratio", display=display.none)
+
+plot(combinedEntrySignal ? 1 : 0, "Combined Entry Signal", display=display.none)
+plot(combinedExitSignal ? 1 : 0, "Combined Exit Signal", display=display.none)
+plot(combinedCautionMild ? 1 : 0, "Combined Caution Mild", display=display.none)
+plot(combinedCautionStrong ? 1 : 0, "Combined Caution Strong", display=display.none)
+plot(combinedCautionCritical ? 1 : 0, "Combined Caution Critical", display=display.none)

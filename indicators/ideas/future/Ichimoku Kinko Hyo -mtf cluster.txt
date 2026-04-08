@@ -1,0 +1,155 @@
+//@version=5
+
+indicator(title='Ichimoku Kinko Hyo - mtf clusters', shorttitle='Ichi clusters', overlay=true)
+
+
+//--------------- Ichimoku ---------------
+
+general_info        = input.bool(title='General description', defval=false, 
+                     tooltip='This script shows Ichimoku indicator endings from the current and higher time frame of the following sub-indicators: Kijun-Sen, Tenkan-Sen, SenkouspanA and SenkouspanB.')
+
+KJ_htf_plot         = input(title='Plot Kijun-sen endings of higher time frames (orange)', defval=true)
+TK_htf_plot         = input(title='Plot Tenkan-sen endings of higher time frames (fuchsia)', defval=true)
+SA_htf_plot         = input(title='Plot SenkouspanA endings of higher time frames (yellow)', defval=true)
+SB_htf_plot         = input(title='Plot SenkouspanB endings of higher time frames (white)', defval=true)
+
+ICHI_plot_end       = input(title='Plot Ichimoku Indicator endings', defval=true)
+ICHI_plot_full      = input(title='Plot Ichimoku cloud full', defval=false)
+
+TKlength            = input.int(9, 'Tenkan-sen length', minval=1)
+KJlength            = input.int(26, 'Kijun-sen length', minval=1)
+CSHSlength          = input.int(26, 'Chikouspan length/horizontal shift', minval=1)
+SBlength            = input.int(52, 'SenkouspanB length', minval=1)
+
+// calculation
+TK                  = math.avg(ta.lowest(TKlength), ta.highest(TKlength))
+KJ                  = math.avg(ta.lowest(KJlength), ta.highest(KJlength))
+CS                  = close
+SB                  = math.avg(ta.lowest(SBlength), ta.highest(SBlength))
+SA                  = math.avg(TK, KJ)
+
+kumo_high           = math.max(SA[CSHSlength - 1], SB[CSHSlength - 1])
+kumo_low            = math.min(SA[CSHSlength - 1], SB[CSHSlength - 1])
+
+// plot Ichimoku full/endings
+plot(ICHI_plot_end or ICHI_plot_full ? TK : na, color=color.new(color.fuchsia, 0), linewidth=ICHI_plot_end ? 2 : 1, title='TenkanSen', show_last=ICHI_plot_end ? 2 : na)
+
+plot(ICHI_plot_end or ICHI_plot_full ? KJ : na, color=color.new(color.orange, 0), linewidth=ICHI_plot_full ? 1 : 2, title='KijunSen', show_last=ICHI_plot_end and not ICHI_plot_full ? 2 : 
+     ICHI_plot_full and ICHI_plot_end or ICHI_plot_full ? na : 2)
+
+plot(ICHI_plot_end or ICHI_plot_full ? CS : na, offset=-CSHSlength + 1, color=CS > kumo_high[CSHSlength - 1] and CS > high[CSHSlength - 1] ? color.green : 
+     CS < kumo_low[CSHSlength - 1] and CS < low[CSHSlength - 1] ? color.maroon : color.gray, linewidth=1, title='ChikouSpan', show_last=ICHI_plot_end ? 10 : na)
+
+SenkouA             = plot(ICHI_plot_end or ICHI_plot_full ? SA : na, offset=CSHSlength - 1, color=color.new(color.green, 100), title='SenkouSpanA', linewidth=1)
+SenkouB             = plot(ICHI_plot_end or ICHI_plot_full ? SB : na, offset=CSHSlength - 1, color=color.new(color.red, 100), title='SenkouSpanB', linewidth=1)
+
+fill(SenkouA, SenkouB, color=SA > SB ? color.new(color.green, ICHI_plot_end ? 80 : 100) : color.new(color.red, ICHI_plot_end ? 80 : 100), title='Kumo', show_last=ICHI_plot_end ? 26 : 0)
+
+// plot Ichimoku Kumo full
+fill(SenkouA, SenkouB, color=SA > SB ? color.new(color.green, ICHI_plot_full ? 80 : 100) : color.new(color.red, ICHI_plot_full ? 80 : 100), title='Kumo')
+
+
+//higher time frame Kijun-Sen / Tenkan-Sen
+KJ_htf_5m       = request.security(syminfo.tickerid, '5', KJ)
+KJ_htf_15m      = request.security(syminfo.tickerid, '15', KJ)
+KJ_htf_1h       = request.security(syminfo.tickerid, '60', KJ)
+KJ_htf_4h       = request.security(syminfo.tickerid, '240', KJ)
+KJ_htf_d        = request.security(syminfo.tickerid, 'D', KJ)
+KJ_htf_w        = request.security(syminfo.tickerid, 'W', KJ)
+KJ_htf_m        = request.security(syminfo.tickerid, 'M', KJ)
+
+TK_htf_5m       = request.security(syminfo.tickerid, '5', TK)
+TK_htf_15m      = request.security(syminfo.tickerid, '15', TK)
+TK_htf_1h       = request.security(syminfo.tickerid, '60', TK)
+TK_htf_4h       = request.security(syminfo.tickerid, '240', TK)
+TK_htf_d        = request.security(syminfo.tickerid, 'D', TK)
+TK_htf_w        = request.security(syminfo.tickerid, 'W', TK)
+TK_htf_m        = request.security(syminfo.tickerid, 'M', TK)
+
+// Kijun plot
+//plot(KJ_htf_plot and timeframe.period == '1' ? KJ_htf_5m : na, color= color.orange, title= "KJ_htf_5", linewidth= 2, show_last= 2, transp= 0)
+
+plot(KJ_htf_plot and (timeframe.period == '1' or timeframe.period == '2' or timeframe.period == '3' or timeframe.period == '5') ? KJ_htf_15m : na, color=color.new(color.orange, 0), title='KJ_htf_15', 
+     linewidth=2, show_last=2)
+
+plot(KJ_htf_plot and (timeframe.period == '1' or timeframe.period == '2' or timeframe.period == '3' or timeframe.period == '5' or timeframe.period == '15') ? KJ_htf_1h : na, color=color.new(color.orange, 0), 
+     title='KJ_htf_1h', linewidth=2, show_last=2)
+
+plot(KJ_htf_plot and timeframe.isintraday ? KJ_htf_4h : na, color=color.new(color.orange, 0), title='KJ_htf_4h', linewidth=2, show_last=2)
+
+plot(KJ_htf_plot and (timeframe.isintraday or timeframe.isdaily) ? KJ_htf_d : na, color=color.new(color.orange, 0), title='KJ_htf_d', linewidth=2, show_last=2)
+
+plot(KJ_htf_plot and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly) ? KJ_htf_w : na, color=color.new(color.orange, 0), title='KJ_htf_w', linewidth=2, show_last=2)
+
+plot(KJ_htf_plot and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly) ? KJ_htf_m : na, color=color.new(color.orange, 0), title='KJ_htf_m', linewidth=2, show_last=2)
+
+
+// Tenkan plot
+//plot(TK_htf_plot and timeframe.period == '1' ? TK_htf_5m : na, color= color.fuchsia, title= "TK_htf_5", linewidth= 2, show_last= 2)
+
+plot(TK_htf_plot and (timeframe.period == '1' or timeframe.period == '2' or timeframe.period == '3' or timeframe.period == '5') ? TK_htf_15m : na, color=color.new(color.fuchsia, 0), title='TK_htf_15', 
+     linewidth=2, show_last=2)
+
+plot(TK_htf_plot and (timeframe.period == '1' or timeframe.period == '2' or timeframe.period == '3' or timeframe.period == '5' or timeframe.period == '15') ? TK_htf_1h : na, color=color.new(color.fuchsia, 0), 
+     title='TK_htf_1h', linewidth=2, show_last=2)
+
+plot(TK_htf_plot and timeframe.isintraday ? TK_htf_4h : na, color=color.new(color.fuchsia, 0), title='TK_htf_4h', linewidth=2, show_last=2)
+
+plot(TK_htf_plot and (timeframe.isintraday or timeframe.isdaily) ? TK_htf_d : na, color=color.new(color.fuchsia, 0), title='TK_htf_d', linewidth=2, show_last=2)
+
+plot(TK_htf_plot and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly) ? TK_htf_w : na, color=color.new(color.fuchsia, 0), title='TK_htf_w', linewidth=2, show_last=2)
+
+plot(TK_htf_plot and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly) ? TK_htf_m : na, color=color.new(color.fuchsia, 0), title='TK_htf_m', linewidth=2, show_last=2)
+
+
+// -------------------- higher time frame sekouspan a ---------------------
+
+SA_htf_15m      = request.security(syminfo.tickerid, '15', SA[CSHSlength - 1])
+SA_htf_1h       = request.security(syminfo.tickerid, '60', SA[CSHSlength - 1])
+SA_htf_4h       = request.security(syminfo.tickerid, '240', SA[CSHSlength - 1])
+SA_htf_d        = request.security(syminfo.tickerid, 'D', SA[CSHSlength - 1])
+SA_htf_w        = request.security(syminfo.tickerid, 'W', SA[CSHSlength - 1])
+SA_htf_m        = request.security(syminfo.tickerid, 'M', SA[CSHSlength - 1])
+
+
+m15_a           = line.new(x1=bar_index[1], x2=bar_index[0], y1=SA_htf_15m, y2=SA_htf_15m, color=color.yellow, width=2)
+h1_a            = line.new(x1=bar_index[1], x2=bar_index[0], y1=SA_htf_1h, y2=SA_htf_1h, color=color.yellow, width=2)
+h4_a            = line.new(x1=bar_index[1], x2=bar_index[0], y1=SA_htf_4h, y2=SA_htf_4h, color=color.yellow, width=2)
+d_a             = line.new(x1=bar_index[1], x2=bar_index[0], y1=SA_htf_d, y2=SA_htf_d, color=color.yellow, width=2)
+w_a             = line.new(x1=bar_index[1], x2=bar_index[0], y1=SA_htf_w, y2=SA_htf_w, color=color.yellow, width=2)
+m_a             = line.new(x1=bar_index[1], x2=bar_index[0], y1=SA_htf_m, y2=SA_htf_m, color=color.yellow, width=2)
+
+
+line.delete(SA_htf_plot and (timeframe.period == '1' or timeframe.period == '2' or timeframe.period == '3' or timeframe.period == '5') ? m15_a[1] : m15_a[0])
+line.delete(SA_htf_plot and (timeframe.period == '1' or timeframe.period == '2' or timeframe.period == '3' or timeframe.period == '5' or timeframe.period == '15') ? h1_a[1] : h1_a[0])
+line.delete(SA_htf_plot and (timeframe.period == '60' or timeframe.period == '120' or timeframe.period == '180') ? h4_a[1] : h4_a[0])
+line.delete(SA_htf_plot and timeframe.isintraday ? d_a[1] : d_a[0])
+line.delete(SA_htf_plot and (timeframe.isintraday or timeframe.isdaily) ? w_a[1] : w_a[0])
+line.delete(SA_htf_plot and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly) ? m_a[1] : m_a[0])
+
+
+
+// -------------------- higher time frame sekouspan b ---------------------
+
+SB_htf_15m      = request.security(syminfo.tickerid, '15', SB[CSHSlength - 1])
+SB_htf_1h       = request.security(syminfo.tickerid, '60', SB[CSHSlength - 1])
+SB_htf_4h       = request.security(syminfo.tickerid, '240', SB[CSHSlength - 1])
+SB_htf_d        = request.security(syminfo.tickerid, 'D', SB[CSHSlength - 1])
+SB_htf_w        = request.security(syminfo.tickerid, 'W', SB[CSHSlength - 1])
+SB_htf_m        = request.security(syminfo.tickerid, 'M', SB[CSHSlength - 1])
+
+
+m15_b           = line.new(x1=bar_index[1], x2=bar_index[0], y1=SB_htf_15m, y2=SB_htf_15m, color=color.white, width=2)
+h1_b            = line.new(x1=bar_index[1], x2=bar_index[0], y1=SB_htf_1h, y2=SB_htf_1h, color=color.white, width=2)
+h4_b            = line.new(x1=bar_index[1], x2=bar_index[0], y1=SB_htf_4h, y2=SB_htf_4h, color=color.white, width=2)
+d_b             = line.new(x1=bar_index[1], x2=bar_index[0], y1=SB_htf_d, y2=SB_htf_d, color=color.white, width=2)
+w_b             = line.new(x1=bar_index[1], x2=bar_index[0], y1=SB_htf_w, y2=SB_htf_w, color=color.white, width=2)
+m_b             = line.new(x1=bar_index[1], x2=bar_index[0], y1=SB_htf_m, y2=SB_htf_m, color=color.white, width=2)
+
+
+line.delete(SB_htf_plot and (timeframe.period == '1' or timeframe.period == '2' or timeframe.period == '3' or timeframe.period == '5') ? m15_b[1] : m15_b[0])
+line.delete(SB_htf_plot and (timeframe.period == '1' or timeframe.period == '2' or timeframe.period == '3' or timeframe.period == '5' or timeframe.period == '15') ? h1_b[1] : h1_b[0])
+line.delete(SB_htf_plot and (timeframe.period == '60' or timeframe.period == '120' or timeframe.period == '180') ? h4_b[1] : h4_b[0])
+line.delete(SB_htf_plot and timeframe.isintraday ? d_b[1] : d_b[0])
+line.delete(SB_htf_plot and (timeframe.isintraday or timeframe.isdaily) ? w_b[1] : w_b[0])
+line.delete(SB_htf_plot and (timeframe.isintraday or timeframe.isdaily or timeframe.isweekly) ? m_b[1] : m_b[0])

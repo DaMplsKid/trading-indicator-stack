@@ -1,0 +1,804 @@
+//@version=6
+indicator("Deep Machine Learning [SatohK]", overlay=false, max_bars_back=3000, max_labels_count = 100)
+import TradingView/ta/9
+
+// -----------------------------------------------------------------------------
+// [1] User-Defined Types (UDT) Definition
+// Defines the structure of a single neural network layer.
+// -----------------------------------------------------------------------------
+type Layer
+    matrix<float> w       // Weights matrix linking previous layer to this layer
+    matrix<float> dw      // Gradients of weights (delta weights) for backpropagation
+    array<float> u        // Pre-activation values (dot product of inputs and weights)
+    array<float> h        // Post-activation values (output of the activation function)
+    array<float> delta    // Error term (delta) used during backpropagation
+    matrix<float> m_w     // 1st moment vector (used for Momentum and Adam optimizers)
+    matrix<float> v_w     // 2nd moment vector (used for RMSprop and Adam optimizers)
+
+// -----------------------------------------------------------------------------
+// [2] User Inputs
+// -----------------------------------------------------------------------------
+
+// --- Engine Configuration ---
+string group_d = '===============> ENGINE CONFIG <==============='
+string optimizer = input.string("Adam", "Optimizer", options=["SGD", "Momentum", "RMSprop", "Adam"], group = group_d, tooltip="Selects the optimization algorithm used to update weights. 'Adam' is widely recommended as it adaptively calculates learning rates for each parameter, combining the benefits of Momentum and RMSprop.")
+var float lr = input.float(0.001, 'Learning Rate', minval = 0.0001, maxval = 1.0, group = group_d, tooltip="Controls how much to change the model in response to the estimated error each time the model weights are updated. Smaller values make learning slower but more precise, while larger values speed up training but may cause instability.")
+float l1_reg = input.float(0.0, "L1 Regularization", minval=0.0, step=0.0001, group = group_d, tooltip="L1 Regularization (Lasso) adds a penalty equal to the absolute value of the magnitude of weights. It encourages sparsity, effectively shrinking less important feature weights down to exactly zero.")
+float l2_reg = input.float(0.0001, "L2 Regularization", minval=0.0, step=0.0001, group = group_d, tooltip="L2 Regularization (Ridge) adds a penalty equal to the square of the magnitude of weights. It prevents any single weight from becoming too large, which strongly helps mitigate overfitting.")
+int num_hidden_layers = input.int(2, "Hidden Layers Count", minval = 1, maxval = 5, group = group_d, tooltip="Determines the depth of the neural network. Deeper networks can model more complex, hierarchical relationships in the data, but require more processing power and are prone to overfitting.")
+int nodes_per_layer = input.int(8, "Nodes per Layer", minval = 1, maxval = 15, group = group_d, tooltip="The number of artificial neurons in each hidden layer. Increasing this expands the model's learning capacity, but setting it too high relative to the data complexity can lead to memorizing noise (overfitting).")
+string activation = input.string("Sigmoid", "Activation Function", ["ReLU","Tanh","Sigmoid"], group = group_d, tooltip="The mathematical function applied to a neuron's output. It introduces non-linearity. 'ReLU' is computationally cheap and avoids vanishing gradients. 'Tanh' centers data between -1 and 1. 'Sigmoid' outputs probabilities between 0 and 1.")
+bool use_layer_norm = input.bool(false, "Apply Layer Normalization", group = group_d, tooltip="Normalizes the outputs of a layer across all features. This stabilizes the hidden state dynamics, dramatically speeds up convergence, and makes the network less sensitive to the initial weight values.")
+var float dropout_rate = input.float(0.2, 'Training Dropout Rate', minval = 0.0, maxval = 0.3, step = 0.1, group = group_d, tooltip="A regularization technique where a percentage of neurons are randomly disabled (set to 0) during each training iteration. This forces the network to learn robust, redundant representations, preventing reliance on specific nodes.")
+int mc_samples = input.int(10, 'MC Dropout Samples', minval = 1, maxval = 100, tooltip="Number of forward passes executed on the latest bar with dropout enabled. This creates an ensemble of predictions from a single model to estimate 'epistemic uncertainty' (how confident the model is in its current prediction).", group = group_d)
+string ci_level_str = input.string("95%", "Confidence Interval Level", options=["68%","80%", "90%", "95%", "99%"], group = group_d, tooltip="The statistical confidence level for the Monte Carlo Dropout uncertainty box. E.g., '68%' represents approximately ±1 standard deviation from the mean prediction.")
+int epoch = input.int(1, 'Training Iterations', minval = 1, maxval = 10, group = group_d, tooltip="The number of times the network updates its weights using randomly sampled historical data per newly formed bar. Higher epochs accelerate adaptation but increase computation time linearly.")
+int seed = input.int(42, 'Deterministic Seed', group = group_d, tooltip="A fixed starting point for the random number generator used in weight initialization and dropout. Keeping this constant ensures the indicator behaves identically upon reloading the chart.")
+
+// Calculate Z-Score multiplier for the selected Confidence Interval (CI) level
+float ci_z_score = ci_level_str == "80%" ? 1.28 : ci_level_str == "90%" ? 1.645 : ci_level_str == "99%" ? 2.576 : ci_level_str == "68%" ? 1. : 1.96
+
+// --- Target Configuration ---
+string group_t = '===============> TARGET CONFIG <==============='
+string target_type = input.string("Pivot State", "Target Type", options=["Candle", "HTF Candle", "Pivot State"], group = group_t, tooltip="'Candle': Network predicts the direction of the current bar. 'HTF Candle': Predicts the Higher Timeframe bar direction. 'Pivot State': Learns the broader market structure and swing states based on historical pivot formations.")
+int predict_period = 0 // Determines how many bars into the future the model tries to predict
+string htf_res = input.timeframe("60", "Higher Timeframe (HTF Candle)", group = group_t, tooltip="Specifies the timeframe resolution used when 'Target Type' is set to 'HTF Candle'.")
+int pivot_left = input.int(20, "Pivot Left (Pivot State)", group = group_t, tooltip="The number of bars to the left required to identify a local Pivot High/Low. Used only if Target Type is 'Pivot State'.")
+int pivot_right = input.int(20, "Pivot Right (Pivot State)", group = group_t, tooltip="The number of bars to the right required to confirm a local Pivot High/Low. Higher values define macro structural swings.")
+float hh_ll_mult = 1.0 // Multiplier for identifying Higher Highs (HH) and Lower Lows (LL)
+
+// --- Feature Vector Configuration (Input Nodes) ---
+string group_i = '===============> FEATURE VECTOR <==============='
+int norm_len = input.int(500, 'Z-Score Lookback', group = group_i, tooltip="The rolling window size used to standardize (Z-Score) the input indicator values. Neural networks train optimally when all input features share a common scale (mean of 0, standard deviation of 1).")
+int sampling_window = input.int(1000, "Sampling Window", minval = 1, group = group_i, tooltip="The maximum historical depth (in bars) from which the algorithm will randomly pull past examples to train the model during live updates.")
+
+bool use_rsi   = input.bool(true, 'RSI (Momentum)      ', inline = "rsi", group = group_i, tooltip="Relative Strength Index. Acts as a momentum feature.")
+int rsi_len    = input.int(14, 'Length', inline = "rsi", group = group_i)
+
+bool use_cci   = input.bool(true, 'CCI (Trend)         ', inline = "cci", group = group_i, tooltip="Commodity Channel Index. Acts as a cyclical trend feature.")
+int cci_len    = input.int(20, 'Length', inline = "cci", group = group_i)
+
+bool use_bb    = input.bool(true, '%B (Volatility)     ', inline = "bb", group = group_i, tooltip="Bollinger Bands %B. Acts as a volatility and price-relative-to-band feature.")
+int bb_len     = input.int(20, 'Length', inline = "bb", group = group_i)
+float bb_mult  = input.float(2.0, 'Mult', inline = "bb", step=0.1, group = group_i)
+
+bool use_macd  = input.bool(true,'MACD (Cycle)        ', inline = "macd", group = group_i, tooltip="Moving Average Convergence Divergence Histogram. Acts as a trend-following momentum feature.")
+int macd_fast  = input.int(12, 'Fast', inline = "macd", group = group_i)
+int macd_slow  = input.int(26, 'Slow', inline = "macd", group = group_i)
+int macd_sig   = input.int(9, 'Signal', inline = "macd", group = group_i)
+
+bool use_stoch = input.bool(false,'Stoch (Pivot)       ', inline = "stoch", group = group_i, tooltip="Stochastic Oscillator. Acts as a mean-reversion and pivot detection feature.")
+int stoch_len  = input.int(14, 'Length', inline = "stoch", group = group_i)
+
+bool use_mfi   = input.bool(false,'MFI (Volume Flow)   ', inline = "mfi", group = group_i, tooltip="Money Flow Index. Incorporates volume data to measure buying/selling pressure.")
+int mfi_len    = input.int(14, 'Length', inline = "mfi", group = group_i)
+
+bool use_chop  = input.bool(false, 'CHOP (Choppiness)   ', inline = "chop", group = group_i, tooltip="Choppiness Index. Indicates whether the market is trending or ranging.")
+int chop_len   = input.int(14, 'Length', inline = "chop", group = group_i)
+
+// Dynamically calculate the number of input nodes based on active features (minimum 1)
+int layer_1 = math.max(1, (use_rsi ? 1 : 0) + (use_cci ? 1 : 0) + (use_bb ? 1 : 0) + (use_macd ? 1 : 0) + (use_stoch ? 1 : 0) + (use_mfi ? 1 : 0) + (use_chop ? 1 : 0))
+
+// --- Signal Moving Average (MA) ---
+string group_ma = '===============> SIGNAL MA <==============='
+bool show_ma = input.bool(true, "Show Signal MA", group=group_ma)
+string ma_type = input.string("EMA", "MA Type", options=["SMA", "EMA", "WMA", "HMA", "RMA", "VWMA"], group=group_ma)
+int ma_len = input.int(9, "MA Length", minval=1, group=group_ma)
+color ma_color = input.color(color.new(#00ffe1, 20), "MA Color", group=group_ma)
+
+// --- Visualization & Kalman Filter ---
+string group_v = '===============> VISUALIZATION & FILTER <==============='
+string bar_style = input.string("Gradient", "Bar Color Style", options=["Solid", "Gradient", "None"], group = group_v, tooltip="Visual style for coloring the chart's candles based on the neural network's prediction confidence.")
+bool apply_kalman = input.bool(true, 'Apply Kalman Filter', group = group_v, tooltip="Passes the raw neural network output through a 1D Kalman Filter. This mathematically minimizes the estimated error covariance, producing a remarkably smooth signal line by removing high-frequency noise.")
+float kf_q = input.float(1.0, 'Kalman Q (Process Noise)', step=0.01, group = group_v, tooltip="Kalman Filter parameter representing 'Process Noise'. It defines how much the system state is expected to change over time. A higher Q makes the filter faster to react but less smooth.")
+float kf_r = input.float(1.0, 'Kalman R (Measurement Noise)', step=0.1, group = group_v, tooltip="Kalman Filter parameter representing 'Measurement Noise'. It defines the expected variance in the raw incoming predictions. A higher R means the filter trusts the raw input less, resulting in a heavier smoothing effect.")
+
+// Define core colors for Bullish (Up) and Bearish (Down) trends using TradingView's standard matte palette
+color color_up = input.color(color.rgb(7, 172, 222), 'Bullish Color', inline="c1", group = group_v)
+color color_dn = input.color(#d92332, 'Bearish Color', inline="c1", group = group_v)
+
+// --- Alerts & Labels ---
+string group_a = '===============> ALERTS & LABELS <==============='
+float alert_threshold = input.float(0.5, 'Alert Threshold (Z-Score)', minval=0., step=0.1, group = group_a, tooltip="The minimum absolute Z-score value required to trigger a Buy or Sell alert. E.g., 0.5 means the prediction must be at least half a standard deviation strong.")
+bool show_chart_labels = input.bool(true, "Show Labels on Chart (force_overlay)", group=group_a, tooltip="If true, plots Buy/Sell arrow labels directly onto the main price chart when alerts trigger.")
+
+// -----------------------------------------------------------------------------
+// [3] Global Variables Declaration
+// -----------------------------------------------------------------------------
+var layers = array.new<Layer>()     // Array holding all hidden layers
+var matrix<float> v = na            // Weights for the output layer
+var matrix<float> dv = na           // Gradients for the output layer weights
+var matrix<float> m_v = na          // 1st moment for output layer optimizer
+var matrix<float> v_v = na          // 2nd moment for output layer optimizer
+var int global_step = 0             // Tracks training steps for Adam bias correction
+var array<float> p = array.new<float>(1, 0.) // Network prediction output
+var array<float> y = array.new<float>(1, 0.) // Target actual value
+x = array.new<float>(layer_1 + 1, 0.)        // Input features vector (+1 for bias)
+
+var box ci_box = na                 // Box used to plot the Confidence Interval in the future
+
+// Kalman Filter state variables
+var float kf_est = 0.0
+var float kf_err = 1.0
+
+// -----------------------------------------------------------------------------
+// [4] Network Initialization
+// -----------------------------------------------------------------------------
+// Initializes weight matrices with random values between -1.0 and 1.0
+Init_Weights(w) =>
+    for i = 0 to matrix.rows(w)-1
+        for j = 0 to matrix.columns(w)-1
+            matrix.set(w, i, j, math.random(0, 1, seed) * 2.0 - 1.0)
+
+// Build the network architecture on the first bar
+if bar_index == 0
+    // Initialize Output Layer
+    v := matrix.new<float>(nodes_per_layer + 1, 1, 0.)
+    dv := matrix.new<float>(nodes_per_layer + 1, 1, 0.)
+    m_v := matrix.new<float>(nodes_per_layer + 1, 1, 0.)
+    v_v := matrix.new<float>(nodes_per_layer + 1, 1, 0.)
+    Init_Weights(v)
+    
+    // Initialize Hidden Layers dynamically
+    int prev_nodes = layer_1 + 1
+    for i = 0 to num_hidden_layers - 1
+        int curr_nodes = nodes_per_layer
+        matrix<float> w = matrix.new<float>(prev_nodes, curr_nodes, 0.)
+        Init_Weights(w)
+        matrix<float> dw = matrix.new<float>(prev_nodes, curr_nodes, 0.)
+        matrix<float> m_w = matrix.new<float>(prev_nodes, curr_nodes, 0.)
+        matrix<float> v_w = matrix.new<float>(prev_nodes, curr_nodes, 0.)
+        array<float> u = array.new<float>(curr_nodes, 0.)
+        array<float> h = array.new<float>(curr_nodes + 1, 0.)
+        array<float> delta = array.new<float>(curr_nodes, 0.)
+        array.push(layers, Layer.new(w, dw, u, h, delta, m_w, v_w))
+        prev_nodes := curr_nodes + 1
+
+// -----------------------------------------------------------------------------
+// [5] Statistical Feature Extraction (Indicators)
+// -----------------------------------------------------------------------------
+// Helper function to calculate the Z-Score (standardization) of any indicator
+get_norm(val) => 
+    float std = ta.stdev(val, norm_len)
+    std != 0 and not na(std) ? (val - ta.sma(val, norm_len)) / std : 0.0
+
+// Calculate and normalize selected indicators
+f_rsi = get_norm(nz(ta.rsi(close, rsi_len), 50.0))
+f_cci = get_norm(nz(ta.cci(close, cci_len), 0.0))
+[_, upper, lower] = ta.bb(close, bb_len, bb_mult)
+f_bb = get_norm((upper - lower) != 0 ? (close - lower) / (upper - lower) : 0.5)
+[_, _, hist] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+f_macd = get_norm(hist)
+f_stoch = get_norm(nz(ta.stoch(close, high, low, stoch_len), 50.0))
+f_mfi = get_norm(nz(ta.mfi(hlc3, mfi_len), 50.0))
+
+// Choppiness Index Calculation
+float chop_atr_sum = math.sum(ta.atr(1), chop_len)
+float chop_hi = ta.highest(high, chop_len)
+float chop_lo = ta.lowest(low, chop_len)
+float chop_raw = 100 * math.log10(chop_atr_sum / (chop_hi - chop_lo)) / math.log10(chop_len)
+f_chop = get_norm(nz(chop_raw, 50.0))
+
+// Function to fetch the normalized feature vector at a specific historical shift
+get_features(shift) =>
+    float[] features = array.new<float>()
+    if use_rsi
+        array.push(features, f_rsi[shift])
+    if use_cci
+        array.push(features, f_cci[shift])
+    if use_bb
+        array.push(features, f_bb[shift])
+    if use_macd
+        array.push(features, f_macd[shift])
+    if use_stoch
+        array.push(features, f_stoch[shift])
+    if use_mfi
+        array.push(features, f_mfi[shift])
+    if use_chop
+        array.push(features, f_chop[shift])
+    
+    // Fallback dummy feature if none are selected
+    if array.size(features) == 0
+        array.push(features, 0.0)
+    features
+
+// -----------------------------------------------------------------------------
+// [6] Target Calculation (With Pivot Lag Correction & HH/LL Detection)
+// -----------------------------------------------------------------------------
+htf_c = request.security(syminfo.tickerid, htf_res, close)
+htf_o = request.security(syminfo.tickerid, htf_res, open)
+
+// Arrays to record confirmed pivots, their exact historical bar indices, and prices
+var array<float> pivot_types = array.new<float>()
+var array<int> pivot_bars = array.new<int>()
+var array<float> pivot_prices = array.new<float>()
+
+ph = ta.pivothigh(high, pivot_left, pivot_right)
+pl = ta.pivotlow(low, pivot_left, pivot_right)
+
+// If a Pivot High is confirmed, evaluate if it is a Higher High (HH)
+if not na(ph)
+    float p_type = -1.0
+    int sz = array.size(pivot_types)
+    if sz > 0
+        // Search backwards for the last PH to check if current PH is higher
+        for i = sz - 1 to 0
+            if array.get(pivot_types, i) < 0 // Found a past PH (-1.0 or -hh_ll_mult)
+                if ph > array.get(pivot_prices, i)
+                    p_type := -hh_ll_mult // Confirmed HH: indicates a stronger trend phase
+                break
+                
+    array.push(pivot_types, p_type) 
+    array.push(pivot_bars, bar_index - pivot_right) // Record the TRUE bar index of the pivot (lag corrected)
+    array.push(pivot_prices, ph)
+
+// If a Pivot Low is confirmed, evaluate if it is a Lower Low (LL)
+if not na(pl)
+    float p_type = 1.0
+    int sz = array.size(pivot_types)
+    if sz > 0
+        // Search backwards for the last PL to check if current PL is lower
+        for i = sz - 1 to 0
+            if array.get(pivot_types, i) > 0 // Found a past PL (1.0 or hh_ll_mult)
+                if pl < array.get(pivot_prices, i)
+                    p_type := hh_ll_mult // Confirmed LL: indicates a stronger trend phase
+                break
+
+    array.push(pivot_types, p_type)  
+    array.push(pivot_bars, bar_index - pivot_right)
+    array.push(pivot_prices, pl)
+
+// Cleanup old pivot records to manage memory
+if array.size(pivot_bars) > 500
+    array.shift(pivot_bars)
+    array.shift(pivot_types)
+    array.shift(pivot_prices)
+
+// Function to evaluate the target value based on the chosen mode
+get_target(shift) =>
+    int target_idx = math.max(0, shift - predict_period)
+    int target_bar = bar_index - target_idx
+    float res = 0.0
+    
+    if target_type == "Candle"
+        res := close[target_idx] >= open[target_idx] ? 1.0 : -1.0
+    else if target_type == "HTF Candle"
+        res := htf_c[target_idx] >= htf_o[target_idx] ? 1.0 : -1.0
+    else if target_type == "Pivot State"
+        float p_val = 1.0 // Default baseline
+        int sz = array.size(pivot_bars)
+        if sz > 0
+            bool found_future = false
+            // Scan array to find the *first pivot that occurs after* the targeted historical bar
+            for i = 0 to sz - 1
+                if array.get(pivot_bars, i) > target_bar
+                    // If the next upcoming pivot is a PH (-1), the current trend is an upward wave (1) leading to it.
+                    // If it is an HH (-2), it is a strong upward wave (2).
+                    // If it is a PL (1), the current trend is a downward wave (-1).
+                    // If it is an LL (2), it is a strong downward wave (-2).
+                    p_val := -array.get(pivot_types, i)
+                    found_future := true
+                    break
+            
+            // If the next pivot is not yet confirmed (still forming), extend the most recently confirmed state
+            if not found_future
+                p_val := array.get(pivot_types, sz - 1)
+        res := p_val
+    res
+
+// -----------------------------------------------------------------------------
+// [7] Neural Network Core Functions (Math & Layers)
+// -----------------------------------------------------------------------------
+// Dense Layer: Performs matrix multiplication between inputs (o) and weights (w)
+Dense(o, w, u) =>
+    for j = 0 to array.size(u) - 1
+        float sum = 0.0
+        for i = 0 to array.size(o) - 1
+            sum += array.get(o, i) * matrix.get(w, i, j)
+        array.set(u, j, sum)
+
+
+// ====================================================================================================
+// [CONCEPT] Activation Functions
+// Neural networks require non-linear transformations to learn complex, non-linear relationships
+// within the data. Without activation functions, a deep neural network would mathematically 
+// collapse into a simple linear regression model, regardless of how many layers it has.
+//
+// 1. ReLU (Rectified Linear Unit): f(x) = max(0, x)
+//    - Replaces negative values with zero, keeping positive values unchanged.
+//    - Extremely computationally efficient.
+//    - Mitigates the "Vanishing Gradient" problem (where gradients become too small to update weights).
+//    - In this code, a "Leaky ReLU" variant is used (f(x) = 0.01 * x for x < 0) to prevent 
+//      "dying ReLU" (neurons permanently outputting zero and stopping learning).
+//
+// 2. Tanh (Hyperbolic Tangent): f(x) = (e^x - e^-x) / (e^x + e^-x)
+//    - S-shaped curve squashing values into the range [-1, 1].
+//    - Zero-centered, which generally makes the optimization process easier and faster than Sigmoid.
+//    - Prone to vanishing gradients for very large positive or negative inputs.
+//
+// 3. Sigmoid: f(x) = 1 / (1 + e^-x)
+//    - S-shaped curve squashing values into the range [0, 1].
+//    - Historically popular, often used in the output layer for probability estimations.
+//    - Suffers heavily from vanishing gradients and is not zero-centered.
+//
+// * Inverted Dropout: During training, some nodes are randomly "dropped" (set to 0) to prevent
+//   overfitting. The remaining active nodes are scaled up by (1 / (1 - drop_rate)) to maintain 
+//   the same expected mathematical sum, ensuring the scale of activations remains consistent during inference.
+// ====================================================================================================
+Activation(u, h, a, apply_dropout, drop_rate) =>
+    float scale = apply_dropout ? 1.0 / (1.0 - drop_rate) : 1.0
+    for i = 0 to array.size(u)-1
+        val = array.get(u, i)
+        float res = 0.0
+        if a == "ReLU"
+            res := val > 0 ? val : val * 0.01 // Leaky ReLU
+        else if a == "Tanh"
+            res := (math.exp(val)-math.exp(-val))/(math.exp(val)+math.exp(-val))
+        else // Sigmoid
+            res := 1/(1+math.exp(-val))
+            
+        // Inverted Dropout Implementation
+        if apply_dropout and math.random(0.0, 1.0) < drop_rate
+            res := 0.0 // Node is dropped
+        else
+            res := res * scale // Scale up active nodes to maintain expected sum
+            
+        array.set(h, i, res)
+    array.set(h, array.size(h)-1, 1.0) // Set Bias node to 1.0
+
+// Layer Normalization: Standardizes node values within a layer to stabilize training
+LayerNorm(u, apply_ln) =>
+    if apply_ln
+        float mean = array.avg(u)
+        float std = array.stdev(u)
+        if std == 0.0 or na(std)
+            std := 1.0
+        for i = 0 to array.size(u) - 1
+            array.set(u, i, (array.get(u, i) - mean) / std)
+
+// Derivative of the Activation Function (used for backpropagation gradients)
+Deriv(h, i, a) =>
+    val = array.get(h, i)
+    float deriv = 0.0
+    if val == 0.0 // Cut off gradient flow for dropped-out nodes
+        deriv := 0.0
+    else
+        if a == "ReLU"
+            deriv := val > 0 ? 1.0 : 0.01
+        else if a == "Tanh"
+            deriv := 1.0 - math.pow(val, 2)
+        else // Sigmoid
+            deriv := (1.0 - val) * val
+    deriv
+
+// -----------------------------------------------------------------------------
+// [8] Optimizer Functions
+// -----------------------------------------------------------------------------
+
+// ====================================================================================================
+// [CONCEPT] Gradient Descent & Optimizers
+// The goal of training a neural network is to find the optimal set of weights that minimizes the 
+// loss function (the error between predictions and actual targets). Backpropagation calculates the 
+// "gradient" (derivative), which indicates the direction to adjust the weights to reduce the error.
+// Optimizers determine *how* the weights are updated based on these gradients.
+//
+// 1. SGD (Stochastic Gradient Descent)
+//    - Update Rule: W_new = W_old - (Learning_Rate * Gradient)
+//    - The most basic approach. It updates weights directly proportional to the current gradient.
+//    - Prone to oscillation in ravines (areas where the loss surface curves much more steeply in 
+//      one dimension than another) and can easily get stuck in local minima.
+//
+// 2. Momentum
+//    - Conceptually similar to a heavy ball rolling down a hill; it accumulates "momentum" in directions 
+//      where gradients consistently point, while dampening oscillations in other directions.
+//    - Computes a moving average of past gradients (1st moment, 'm').
+//    - Helps accelerate SGD in the relevant direction.
+//
+// 3. RMSprop (Root Mean Square Propagation)
+//    - Addresses the issue of a global learning rate by adapting the learning rate for each weight individually.
+//    - It keeps a moving average of the *squared* gradients (2nd moment, 'v_m').
+//    - Weights with large recent gradients get a smaller effective learning rate, and vice versa. 
+//      This prevents exploding gradients and handles non-stationary objectives well.
+//
+// 4. Adam (Adaptive Moment Estimation)
+//    - Combines the best properties of both Momentum (1st moment 'm') and RMSprop (2nd moment 'v_m').
+//    - 'm' tracks the direction of recent gradients, while 'v_m' tracks the magnitude.
+//    - Adam dynamically adjusts the learning rate for each individual weight.
+//    - Includes "Bias Correction" (m_hat, v_hat) to counteract the fact that m and v are initialized to zero,
+//      which otherwise causes an initial bias toward zero, especially during early training steps.
+//    - Generally considered the most robust and standard choice for deep learning applications.
+// ====================================================================================================
+Update_Weights(w, dw, m_w, v_w, opt_type, step) =>
+    float beta1 = 0.9
+    float beta2 = 0.999
+    float epsilon = 1e-8
+    
+    for i = 0 to matrix.rows(w) - 1
+        for j = 0 to matrix.columns(w) - 1
+            float g = matrix.get(dw, i, j)
+            float current_w = matrix.get(w, i, j)
+            
+            // Apply L1 & L2 Regularization (Skip the Bias row, which is the last row)
+            if i < matrix.rows(w) - 1
+                if l1_reg > 0.0
+                    g += l1_reg * math.sign(current_w) // L1 Penalty
+                if l2_reg > 0.0
+                    g += l2_reg * current_w            // L2 Penalty
+
+            float new_w = current_w
+            
+            if opt_type == "SGD"
+                new_w := current_w - lr * g
+            else if opt_type == "Momentum"
+                float m = matrix.get(m_w, i, j)
+                float new_m = beta1 * m + lr * g
+                matrix.set(m_w, i, j, new_m)
+                new_w := current_w - new_m
+            else if opt_type == "RMSprop"
+                float v_m = matrix.get(v_w, i, j)
+                float new_v = beta1 * v_m + (1.0 - beta1) * math.pow(g, 2)
+                matrix.set(v_w, i, j, new_v)
+                new_w := current_w - lr * g / (math.sqrt(new_v) + epsilon)
+            else if opt_type == "Adam"
+                float m = matrix.get(m_w, i, j)
+                float v_m = matrix.get(v_w, i, j)
+                float new_m = beta1 * m + (1.0 - beta1) * g
+                float new_v = beta2 * v_m + (1.0 - beta2) * math.pow(g, 2)
+                matrix.set(m_w, i, j, new_m)
+                matrix.set(v_w, i, j, new_v)
+                
+                // Bias correction for Adam (compensates for initialization at zero)
+                float m_hat = new_m / (1.0 - math.pow(beta1, step))
+                float v_hat = new_v / (1.0 - math.pow(beta2, step))
+                new_w := current_w - lr * m_hat / (math.sqrt(v_hat) + epsilon)
+                
+            matrix.set(w, i, j, new_w)
+
+// -----------------------------------------------------------------------------
+// [9] Engine: Online Training Loop (Executes on every bar)
+// -----------------------------------------------------------------------------
+for e = 0 to epoch
+    // Randomly sample a historical bar within the window (excluding bars that don't have a realized target yet)
+    t = int(math.random(predict_period + 1, sampling_window))
+    float[] feats = get_features(t)
+    
+    // Load features into the input array
+    for i = 0 to layer_1 - 1
+        array.set(x, i, nz(array.get(feats, i), 0.0))
+    array.set(x, layer_1, 1.0) // Set Bias input
+
+    // Forward Propagation (Training phase: Dropout is ON)
+    for i = 0 to num_hidden_layers - 1
+        Layer L = array.get(layers, i)
+        array<float> prev_input = (i == 0) ? x : array.get(layers, i-1).h
+        Dense(prev_input, L.w, L.u)
+        LayerNorm(L.u, use_layer_norm)
+        Activation(L.u, L.h, activation, true, dropout_rate)
+    Layer last_L = array.get(layers, num_hidden_layers-1)
+    Dense(last_L.h, v, p)
+
+    // Calculate prediction error
+    float delta_out = array.get(p, 0) - get_target(t)
+    
+    // Backpropagation: Output Layer Delta
+    for i = 0 to array.size(last_L.delta)-1
+        array.set(last_L.delta, i, delta_out * matrix.get(v, i, 0) * Deriv(last_L.h, i, activation))
+    
+    // Backpropagation: Hidden Layers Deltas
+    if num_hidden_layers > 1
+        for i = num_hidden_layers-2 to 0
+            Layer curr = array.get(layers, i)
+            Layer next = array.get(layers, i+1)
+            for j = 0 to array.size(curr.delta)-1
+                float err = 0.0
+                for k = 0 to array.size(next.delta)-1
+                    err += array.get(next.delta, k) * matrix.get(next.w, j, k)
+                array.set(curr.delta, j, err * Deriv(curr.h, j, activation))
+    
+    // Update Weights Using Optimizer
+    global_step += 1 // Increment step count for Adam bias correction
+    
+    // Compute gradients for Output Layer
+    for i = 0 to matrix.rows(v)-1
+        matrix.set(dv, i, 0, delta_out * array.get(last_L.h, i))
+    Update_Weights(v, dv, m_v, v_v, optimizer, global_step)
+
+    // Compute gradients for Hidden Layers
+    for k = 0 to num_hidden_layers-1
+        Layer L = array.get(layers, k)
+        array<float> prev_update = (k == 0) ? x : array.get(layers, k-1).h
+        for i = 0 to matrix.rows(L.w)-1
+            for j = 0 to matrix.columns(L.w)-1
+                matrix.set(L.dw, i, j, array.get(L.delta, j) * array.get(prev_update, i))
+        
+        Update_Weights(L.w, L.dw, L.m_w, L.v_w, optimizer, global_step)
+
+// -----------------------------------------------------------------------------
+// [10] Current Inference (Forward Feed for Prediction)
+// -----------------------------------------------------------------------------
+float[] curr_feats = get_features(0)
+for i = 0 to layer_1 - 1
+    array.set(x, i, nz(array.get(curr_feats, i), 0.0))
+array.set(x, layer_1, 1.0)
+
+// Forward pass for the current bar (Inference phase: Dropout is OFF)
+for i = 0 to num_hidden_layers - 1
+    Layer L = array.get(layers, i)
+    array<float> prev_inf = (i == 0) ? x : array.get(layers, i-1).h
+    Dense(prev_inf, L.w, L.u)
+    LayerNorm(L.u, use_layer_norm)
+    Activation(L.u, L.h, activation, false, 0.0) 
+Layer final_L = array.get(layers, num_hidden_layers-1)
+Dense(final_L.h, v, p)
+
+// -----------------------------------------------------------------------------
+// [11] Statistical Post-Processing & Kalman Filter Application
+// -----------------------------------------------------------------------------
+float pred_raw = array.get(p, 0)
+// Smooth the standard deviation of raw predictions to compute a stable Z-score multiplier
+float stdev_p = ta.median(ta.stdev(pred_raw, 500),500)
+float scale_factor = stdev_p != 0 ? 1.0 / stdev_p : 0.0
+
+// Convert prediction into a standardized Z-Score and clamp it between -3.0 and 3.0
+float NN_value = pred_raw * scale_factor
+NN_value := NN_value > 3.0 ? 3.0 : NN_value < -3.0 ? -3.0 : NN_value
+
+// Apply 1D Kalman Filter to smooth the final signal
+if apply_kalman
+    float p_err = kf_err + kf_q
+    float k_gain = p_err / (p_err + kf_r)
+    kf_est := kf_est + k_gain * (NN_value - kf_est)
+    kf_err := (1.0 - k_gain) * p_err
+    NN_value := kf_est
+else
+    kf_est := NN_value
+
+// -----------------------------------------------------------------------------
+// [12] MC Dropout (Uncertainty Estimation) & Confidence Box Plotting
+// -----------------------------------------------------------------------------
+float ci_margin = 0.0
+
+// Calculate uncertainty only on the latest bar to save computation resources
+if barstate.islast
+    array<float> mc_preds = array.new<float>()
+    // Run multiple forward passes with Dropout enabled
+    for m = 0 to mc_samples - 1
+        for i = 0 to num_hidden_layers - 1
+            Layer L_mc = array.get(layers, i)
+            array<float> prev_inf_mc = (i == 0) ? x : array.get(layers, i-1).h
+            Dense(prev_inf_mc, L_mc.w, L_mc.u)
+            LayerNorm(L_mc.u, use_layer_norm)
+            Activation(L_mc.u, L_mc.h, activation, true, dropout_rate) // Dropout ON
+        
+        Layer final_L_mc = array.get(layers, num_hidden_layers-1)
+        array<float> p_mc = array.new<float>(1, 0.0)
+        Dense(final_L_mc.h, v, p_mc)
+        array.push(mc_preds, array.get(p_mc, 0))
+    
+    // Calculate the margin based on the standard deviation of MC predictions
+    float mc_std = array.stdev(mc_preds)
+    ci_margin := (mc_std * ci_z_score) * scale_factor
+    
+    // Restore the network state to deterministic mode (Dropout OFF) for dashboard UI display
+    for i = 0 to num_hidden_layers - 1
+        Layer L_rest = array.get(layers, i)
+        array<float> prev_inf_rest = (i == 0) ? x : array.get(layers, i-1).h
+        Dense(prev_inf_rest, L_rest.w, L_rest.u)
+        LayerNorm(L_rest.u, use_layer_norm)
+        Activation(L_rest.u, L_rest.h, activation, false, 0.0)
+
+    // Draw the Confidence Interval Box projected into the future (avoids overlapping the oscillator)
+    color box_bg = NN_value > 0 ? color.new(color_up, 85) : color.new(color_dn, 85)
+    color box_border = NN_value > 0 ? color.new(color_up, 50) : color.new(color_dn, 50)
+    
+    // Shift the box to the right (future bars)
+    int shift_left  = bar_index + 5
+    int shift_right = bar_index + 20
+    
+    if na(ci_box)
+        ci_box := box.new(left=shift_left, top=NN_value + ci_margin, right=shift_right, bottom=NN_value - ci_margin, border_color=box_border, border_width=1, bgcolor=box_bg, text=ci_level_str + " CI", text_size=size.tiny, text_color=color.new(#ffffff, 20), text_halign=text.align_center, text_valign=text.align_center)
+    else
+        box.set_left(ci_box, shift_left)
+        box.set_right(ci_box, shift_right)
+        box.set_top(ci_box, NN_value + ci_margin)
+        box.set_bottom(ci_box, NN_value - ci_margin)
+        box.set_bgcolor(ci_box, box_bg)
+        box.set_border_color(ci_box, box_border)
+        box.set_text(ci_box, ci_level_str + " CI")
+        box.set_text_color(ci_box, color.new(#ffffff, 20))
+
+// -----------------------------------------------------------------------------
+// [13] Color Logic (Dynamic Gradient 2-Color System)
+// -----------------------------------------------------------------------------
+// Helper function to dynamically calculate color opacity based on standard deviations
+get_dynamic_color(val, stdev_val, min_alpha, max_alpha) =>
+    // Uses 2x the standard deviation (2 sigma) as the upper bound for color scaling
+    float max_val = stdev_val * 2.0
+    float ratio = max_val == 0 ? 0 : math.min(1.0, math.max(0.0, math.abs(val) / max_val))
+    float alpha = max_alpha - (ratio * (max_alpha - min_alpha))
+    val > 0 ? color.new(color_up, int(alpha)) : color.new(color_dn, int(alpha))
+
+// Helper function to colorize hidden layer nodes in the dashboard
+get_hidden_color(val, act_type) =>
+    float norm_val = val
+    float max_v = 1.0
+    if act_type == "Sigmoid"
+        norm_val := val - 0.5 // Center sigmoid
+        max_v := 0.5
+    else if act_type == "ReLU"
+        norm_val := val - 0.5
+        max_v := 1.0
+    
+    float ratio = math.min(1.0, math.max(0.0, math.abs(norm_val) / max_v))
+    float alpha = 90.0 - (ratio * 70.0) // Ranges from 20 (Dark/Strong) to 90 (Light/Weak)
+    norm_val > 0 ? color.new(color_up, int(alpha)) : color.new(color_dn, int(alpha))
+
+// -----------------------------------------------------------------------------
+// [14] Oscillator Plotting
+// -----------------------------------------------------------------------------
+// Define dynamic colors for lines, fills, and bars based on actual standard deviation
+stdev_NN = ta.stdev(NN_value,500)
+color line_color      = get_dynamic_color(NN_value, stdev_NN, 0, 0)      // Line is fully opaque
+color fill_color      = get_dynamic_color(NN_value, stdev_NN, 70, 95)    // Fill is highly transparent
+color bar_grad_color  = get_dynamic_color(NN_value, stdev_NN, 0, 70)     // Bar color uses a wide gradient
+color bar_solid_color = NN_value > 0 ? color.new(color_up, 30) : color.new(color_dn, 30) // Solid fallback
+
+// Apply the user's chosen bar color style
+color active_bar_color = na
+if bar_style == "Gradient"
+    active_bar_color := bar_grad_color
+else if bar_style == "Solid"
+    active_bar_color := bar_solid_color
+
+barcolor(bar_style != "None"?active_bar_color:na)
+
+// Main Oracle line and Neutral Axis
+p_main = plot(NN_value, "Oracle Line", color.new(line_color,20), 1, plot.style_steplinebr)
+p_main_h = plot(NN_value, "Oracle Hist", math.abs(NN_value)>math.abs(nz(NN_value[1]))?color.new(line_color,40):color.new(line_color,80), 1, plot.style_histogram)
+p_mid  = plot(0, "Neutral Axis", color.new(color.gray, 60))
+fill(p_main, p_mid, NN_value, 0, fill_color, fill_color)
+
+// Sigma standard deviation levels
+hline_pos = hline(1.0, "+1 sigma", color=color_up,linestyle = hline.style_dotted)
+hline_neg = hline(-1.0, "-1 sigma", color=color_dn,linestyle = hline.style_dotted)
+hline_pos_2 = hline(2.0, "+2 sigma", color=color_up,linestyle = hline.style_solid)
+hline_neg_2 = hline(-2.0, "-2 sigma", color=color_dn,linestyle = hline.style_solid)
+
+// --- Signal Moving Average (MA) Sub-routine ---
+get_ma(src, length, type) =>
+    float ma = src
+    if type == "SMA"
+        ma := ta.sma(src, length)
+    else if type == "EMA"
+        ma := ta.ema(src, length)
+    else if type == "WMA"
+        ma := ta.wma(src, length)
+    else if type == "HMA"
+        ma := ta.hma(src, length)
+    else if type == "RMA"
+        ma := ta.rma(src, length)
+    else if type == "VWMA"
+        ma := ta.vwma(src, length)
+    ma
+
+float nn_ma = show_ma ? get_ma(NN_value, ma_len, ma_type) : na
+plot(nn_ma, "Signal MA", color.new(ma_color, 20), 1, plot.style_line)
+
+// --- Zero Line Cross Visual Cues ---
+bool cross_up = ta.crossover(NN_value, 0.0)
+bool cross_dn = ta.crossunder(NN_value, 0.0)
+
+plotshape(cross_up ? 0.0 : na, title="Cross Up", style=shape.circle, location=location.absolute, color=color.new(color_up, 0))
+plotshape(cross_dn ? 0.0 : na, title="Cross Down", style=shape.circle, location=location.absolute, color=color.new(color_dn, 0))
+
+// -----------------------------------------------------------------------------
+// [15] Alerts & Chart Overlays
+// -----------------------------------------------------------------------------
+// Determine if prediction crosses the user-defined threshold
+bool buy_alert  = ta.crossover(NN_value, alert_threshold)
+bool sell_alert = ta.crossunder(NN_value, -alert_threshold)
+
+// Filter signals to trigger only upon a reversal (preventing multiple consecutive alerts)
+var int current_signal = 0
+bool is_new_buy = buy_alert and current_signal != 1
+bool is_new_sell = sell_alert and current_signal != -1
+
+if is_new_buy
+    current_signal := 1
+else if is_new_sell
+    current_signal := -1
+
+// Overlay text labels onto the main chart
+float offset_atr = ta.atr(100)
+if show_chart_labels
+    if is_new_buy
+        label.new(bar_index, low-offset_atr, style=label.style_label_up, color=nn_ma>0?color.new(color_up,20):color.new(color_up,50), textcolor=color.white, size=size.small, force_overlay=true)
+    if is_new_sell
+        label.new(bar_index, high+offset_atr, style=label.style_label_down, color=nn_ma<0?color.new(color_dn,20):color.new(color_dn,50), textcolor=color.white, size=size.small, force_overlay=true)
+
+// Native TradingView Alerts
+if is_new_buy
+    alert("NN Oracle: Bullish Signal Triggered! Value: " + str.tostring(NN_value, "#.##"), alert.freq_once_per_bar_close)
+if is_new_sell
+    alert("NN Oracle: Bearish Signal Triggered! Value: " + str.tostring(NN_value, "#.##"), alert.freq_once_per_bar_close)
+
+alertcondition(is_new_buy, title="Bullish Alert", message="NN Oracle Bullish Signal")
+alertcondition(is_new_sell, title="Bearish Alert", message="NN Oracle Bearish Signal")
+
+// -----------------------------------------------------------------------------
+// [16] Intelligent Dashboard UI (Dark / Calm Theme)
+// -----------------------------------------------------------------------------
+var table tbl = table.new(position.top_right, 10, 20, frame_color=color.new(#363a45, 0), frame_width=1, border_color=color.new(#363a45, 50), border_width=1,force_overlay = true)
+
+if barstate.islast
+    color header_bg = color.new(#181c25, 0) // Matte dark background for headers
+    color label_bg  = color.new(#222630, 0) // Matte dark background for labels
+    color empty_bg  = color.new(#000000, 100) // Transparent for empty cells
+    
+    // Draw Headers
+    table.cell(tbl, 0, 0, "VECTOR", text_color=color.gray, bgcolor=header_bg, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, "INPUT", text_color=color.gray, bgcolor=header_bg, text_size=size.tiny, text_halign=text.align_center)
+    for l = 0 to num_hidden_layers - 1
+        table.cell(tbl, l + 2, 0, "L" + str.tostring(l+1), text_color=color.gray, bgcolor=header_bg, text_size=size.tiny, text_halign=text.align_center)
+    
+    int out_col = num_hidden_layers + 2
+    table.cell(tbl, out_col, 0, "ORACLE", text_color=color.gray, bgcolor=header_bg, text_size=size.tiny, text_halign=text.align_center)
+
+    // Map feature labels
+    string[] fn = array.new<string>()
+    if use_rsi
+        array.push(fn, "RSI")
+    if use_cci
+        array.push(fn, "CCI")
+    if use_bb
+        array.push(fn, "%B")
+    if use_macd
+        array.push(fn, "MACD")
+    if use_stoch
+        array.push(fn, "Stoch")
+    if use_mfi
+        array.push(fn, "MFI")
+    if use_chop
+        array.push(fn, "CHOP")
+    if array.size(fn) == 0
+        array.push(fn, "N/A")
+
+    // Map node values to cells
+    int max_rows = math.max(layer_1, nodes_per_layer)
+    for r = 0 to max_rows - 1
+        int row = r + 1
+        
+        // Input Feature Vector column
+        if r < layer_1
+            val = array.get(x, r)
+            table.cell(tbl, 0, row, fn.get(math.min(r, array.size(fn)-1)), text_color=color.silver, bgcolor=label_bg, text_size=size.tiny, text_halign=text.align_left)
+            table.cell(tbl, 1, row, str.tostring(val, "#.##"), text_color=color.white, bgcolor=get_dynamic_color(val, 1.0, 40, 85), text_size=size.tiny, text_halign=text.align_center)
+        else
+            table.cell(tbl, 0, row, "", bgcolor=empty_bg)
+            table.cell(tbl, 1, row, "", bgcolor=empty_bg)
+            
+        // Hidden Layer Nodes columns
+        for l_idx = 0 to num_hidden_layers - 1
+            if r < nodes_per_layer
+                Layer curr_layer = array.get(layers, l_idx)
+                h_val = array.get(curr_layer.h, r)
+                table.cell(tbl, l_idx + 2, row, str.tostring(h_val, "#.##"), text_color=color.white, bgcolor=get_hidden_color(h_val, activation), text_size=size.tiny, text_halign=text.align_center)
+            else
+                table.cell(tbl, l_idx + 2, row, "", bgcolor=empty_bg)
+
+    // Output Block (Oracle Final Prediction)
+    table.merge_cells(tbl, out_col, 1, out_col, 2)
+    table.cell(tbl, out_col, 1, str.tostring(NN_value, "#.##"), text_color=line_color, bgcolor=label_bg, text_size=size.large, text_halign=text.align_center)
+    
+    // Label for current phase status
+    string phase = NN_value > 2.0 ? "STRONG BUY" : NN_value < -2.0 ? "STRONG SELL" : NN_value > 0 ? "BULLISH" : "BEARISH"
+    table.cell(tbl, out_col, 3, phase, text_color=line_color, bgcolor=label_bg, text_size=size.small, text_halign=text.align_center)
+    
+    // Display MC Dropout Uncertainty Level
+    table.cell(tbl, out_col, 4, "Uncertainty", text_color=color.gray, bgcolor=label_bg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl, out_col, 5, "±" + str.tostring(ci_margin, "#.##"), text_color=color.silver, bgcolor=label_bg, text_size=size.tiny, text_halign=text.align_center, tooltip=ci_level_str + " CI computed via MC Dropout")
+
+    // Cleanup unused cells at the bottom of the table to prevent visual artifacts
+    for r = 5 to max_rows - 1
+        int row = r + 1
+        table.cell(tbl, out_col, row, "", bgcolor=empty_bg)

@@ -1,0 +1,785 @@
+//@version=5
+indicator("Unified Regime Engine v2 — Dual Engine [Divergence]", 
+     shorttitle="URE v2 Div", 
+     overlay=false,
+     max_lines_count=500, 
+     max_labels_count=200)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  CONSENSUS MODE SELECTOR
+// ═════════════════════════════════════════════════════════════════════════════
+
+consensus_mode = input.string("EITHER", "Consensus Mode", 
+     options=["EITHER", "BOTH", "SIMPLE ONLY", "ADVANCED ONLY"], 
+     group="═══ CONSENSUS MODE ═══",
+     tooltip="EITHER = Trade if Simple OR Advanced shows setup\nBOTH = Only trade when both engines agree\nSIMPLE ONLY = Fast/responsive\nADVANCED ONLY = Quality filtered")
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  CORE INPUTS (SHARED BY BOTH ENGINES)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Musashi FDI Core (3/5/10 SCALPER)
+len_musashi = input.int(5, "Musashi Window", minval=1, group="Musashi FDI Core")
+multiscale = input.bool(true, "Use multiscale", group="Musashi FDI Core")
+len_musashi_short = input.int(3, "Musashi Short", minval=1, group="Musashi FDI Core")
+len_musashi_long  = input.int(10, "Musashi Long", minval=1, group="Musashi FDI Core")
+
+musashi_weight_core = input.float(0.65, "Efficiency weight", minval=0.0, maxval=1.0, step=0.05, group="Musashi FDI Core")
+musashi_weight_entropy = input.float(0.35, "Entropy weight", minval=0.0, maxval=1.0, step=0.05, group="Musashi FDI Core")
+
+use_cfb = input.bool(true, "Use CFB (R²)", group="Musashi FDI Core")
+cfb_short = input.int(3, "CFB Short", minval=1, group="Musashi FDI Core")
+cfb_med   = input.int(5, "CFB Medium", minval=1, group="Musashi FDI Core")
+cfb_long  = input.int(10, "CFB Long", minval=1, group="Musashi FDI Core")
+
+adaptive_lookback = input.int(200, "Adaptive lookback", minval=1, group="Musashi FDI Core")
+
+// JMA/iTrend Directional Engine
+jma_len       = input.int(12,   "JMA Length",    minval=1, group="JMA/iTrend Direction")
+jma_phase     = input.int(40,   "JMA Phase",     minval=-100, maxval=100, group="JMA/iTrend Direction")
+jma_power     = input.int(2,    "JMA Power",     minval=1, maxval=10, group="JMA/iTrend Direction")
+itrend_alpha  = input.float(0.09, "iTrend Alpha", step=0.01, group="JMA/iTrend Direction")
+accel_len     = input.int(2,    "Acceleration Smooth", minval=1, group="JMA/iTrend Direction")
+slope_len     = input.int(2,    "Slope Lookback",      minval=1, group="JMA/iTrend Direction")
+
+// Independent Efficiency Ratio
+er_length = input.int(10, "ER Length", minval=1, group="Efficiency Ratio")
+er_fast_length = input.int(5, "ER Fast JMA", minval=1, group="Efficiency Ratio")
+er_slow_length = input.int(14, "ER Slow JMA", minval=1, group="Efficiency Ratio")
+er_jma_phase = input.float(60, "ER JMA Phase", minval=-100, maxval=100, group="Efficiency Ratio")
+er_jma_power = input.float(2, "ER JMA Power", minval=1, step=0.1, group="Efficiency Ratio")
+
+er_strong_thr = input.float(0.45, "ER Strong", step=0.05, minval=0.0, maxval=1.0, group="Efficiency Ratio")
+er_weak_thr = input.float(0.25, "ER Weak", step=0.05, minval=0.0, maxval=1.0, group="Efficiency Ratio")
+er_elite_thr = input.float(0.65, "ER Elite", step=0.05, minval=0.0, maxval=1.0, group="Efficiency Ratio")
+
+// ATR Ratio Volatility
+atr_length = input.int(7, "ATR Length", minval=1, group="ATR Volatility")
+atr_jma_length = input.int(30, "ATR JMA Length", minval=1, group="ATR Volatility")
+atr_jma_phase = input.float(0, "ATR JMA Phase", minval=-100, maxval=100, group="ATR Volatility")
+atr_jma_power = input.float(2, "ATR JMA Power", minval=1, step=0.1, group="ATR Volatility")
+vol_compressed_thr = input.float(1.05, "Compressed Threshold", step=0.05, minval=0.1, maxval=2.0, group="ATR Volatility")
+vol_expanded_thr = input.float(1.35, "Expanded Threshold", step=0.05, minval=0.1, maxval=2.0, group="ATR Volatility")
+
+// Regime Thresholds
+trend_thr_base = input.float(0.50, "Trend threshold", step=0.01, minval=0.4, maxval=1.0, group="Regime Thresholds")
+range_thr_base = input.float(0.30, "Range threshold", step=0.01, minval=0.0, maxval=0.5, group="Regime Thresholds")
+
+min_confidence = input.float(0.50, "Minimum confidence", step=0.05, minval=0.0, maxval=1.0, group="Regime Thresholds")
+elite_confidence = input.float(0.70, "Elite confidence", step=0.05, minval=0.0, maxval=1.0, group="Regime Thresholds")
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SIMPLE ENGINE INPUTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+jma_fre_len  = input.int(3, "Simple: Final JMA smoothing", minval=2, group="Simple Engine (FRE)")
+jma_fre_phase = input.float(0.7, "Simple: Final JMA phase", step=0.01, minval=0.0, maxval=1.0, group="Simple Engine (FRE)")
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  ADVANCED ENGINE INPUTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+process_noise = input.float(0.020, "Advanced: Process noise", step=0.001, minval=0.001, maxval=0.1, group="Advanced Engine (URS)")
+measurement_noise = input.float(0.05, "Advanced: Measurement noise", step=0.01, minval=0.01, maxval=0.2, group="Advanced Engine (URS)")
+
+stress_lookback = input.int(4, "Advanced: Stress window", minval=0, maxval=50, group="Advanced Engine (URS)")
+stress_low = input.float(0.20, "Advanced: Stable threshold", step=0.05, minval=0.0, maxval=1.0, group="Advanced Engine (URS)")
+stress_medium = input.float(0.35, "Advanced: Caution threshold", step=0.05, minval=0.0, maxval=1.0, group="Advanced Engine (URS)")
+stress_high = input.float(0.50, "Advanced: Danger threshold", step=0.05, minval=0.0, maxval=1.0, group="Advanced Engine (URS)")
+
+adaptive_thresholds = input.bool(true, "Advanced: Adaptive thresholds", group="Advanced Engine (URS)")
+
+enable_micro = input.bool(true, "Advanced: Microstructure", group="Advanced Engine (URS)")
+vol_accel_len = input.int(5, "Advanced: Vol surge length", minval=2, group="Advanced Engine (URS)")
+vol_surge_mult = input.float(2.0, "Advanced: Vol surge mult", step=0.5, minval=1.0, group="Advanced Engine (URS)")
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  VISUAL SETTINGS
+// ═════════════════════════════════════════════════════════════════════════════
+
+show_dual_plots = input.bool(true, "Show Both Engine Lines", group="Visuals")
+show_values = input.bool(true, "Show Metrics Table", group="Visuals")
+show_zones = input.bool(true, "Show Threshold Zones", group="Visuals")
+show_markers = input.bool(true, "Show Signal Markers", group="Visuals")
+// Divergence Detection
+enable_divergence = input.bool(true, "Enable Divergence Detection", group="Divergence")
+divergence_pivot_len = input.int(5, "Pivot Length", minval=2, maxval=20, group="Divergence",
+     tooltip="Number of bars on each side to form a pivot")
+divergence_lookback = input.int(10, "Lookback Bars", minval=5, maxval=50, group="Divergence",
+     tooltip="How far back to compare pivots for divergence")
+
+
+long_only_mode = input.bool(true, "LONG ONLY MODE", group="Visuals")
+
+use_dynamic_opacity = input.bool(true, "Dynamic Opacity", group="Visuals")
+base_opacity = input.int(90, "Base Opacity", minval=0, maxval=100, group="Visuals")
+strong_opacity = input.int(50, "Strong Opacity", minval=0, maxval=100, group="Visuals")
+
+// Unified Output Colors
+col_long_elite = input.color(color.new(color.white, 0), "LONG ELITE", group="Output Colors")
+col_long_strong = input.color(color.new(color.green, 0), "LONG STRONG", group="Output Colors")
+col_long_early = input.color(color.new(color.yellow, 0), "LONG EARLY", group="Output Colors")
+col_exit_warning = input.color(color.new(#808000, 0), "EXIT WARNING", group="Output Colors")
+col_flat = input.color(color.new(#404040, 0), "FLAT", group="Output Colors")
+
+// Engine Line Colors
+col_simple_line = input.color(color.new(color.blue, 0), "Simple Engine Line", group="Engine Colors")
+col_advanced_line = input.color(color.new(color.purple, 0), "Advanced Engine Line", group="Engine Colors")
+
+// JMA Colors
+col_strong_up = input.color(color.new(color.lime, 0), "JMA Strong Up", group="JMA Colors")
+col_weak_up = input.color(color.new(color.yellow, 0), "JMA Weak Up", group="JMA Colors")
+col_slowing_dn = input.color(color.new(color.aqua, 0), "JMA Slowing", group="JMA Colors")
+col_down = input.color(color.new(color.red, 0), "JMA Down", group="JMA Colors")
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  UTILITY FUNCTIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+shannon_entropy(src, length, bins) =>
+    ret = src - src[1]
+    lo = ta.lowest(ret, length)
+    hi = ta.highest(ret, length)
+    range_val = math.max(hi - lo, 1e-10)
+    counts = array.new_float(bins, 0.0)
+    for k = 0 to length - 1
+        r = ret[k]
+        idx = int(math.floor((r - lo) / range_val * bins))
+        idx := math.max(0, math.min(bins - 1, idx))
+        array.set(counts, idx, array.get(counts, idx) + 1.0)
+    ent = 0.0
+    total = float(length)
+    for i = 0 to bins - 1
+        p = array.get(counts, i) / total
+        if p > 1e-10
+            ent -= p * math.log(p)
+    maxEnt = math.log(bins)
+    normEnt = maxEnt == 0 ? 0.0 : ent / maxEnt
+    math.max(0.0, math.min(1.0, normEnt))
+
+r_squared(src, length) =>
+    mean_x = (length - 1) / 2.0
+    mean_y = ta.sma(src, length)
+    num = 0.0
+    den = 0.0
+    for i = 0 to length - 1
+        xi = float(i) - mean_x
+        yi = src[i] - mean_y
+        num += xi * yi
+        den += xi * xi
+    slope = den == 0 ? 0.0 : num / den
+    ssr = 0.0
+    sst = 0.0
+    for i = 0 to length - 1
+        xi = float(i) - mean_x
+        pred = slope * xi + mean_y
+        ssr += math.pow(pred - mean_y, 2)
+        sst += math.pow(src[i] - mean_y, 2)
+    r2 = sst == 0 ? 0.0 : ssr / sst
+    math.max(0.0, math.min(1.0, r2))
+
+percentile_normalize(val, lookback) =>
+    hi = ta.highest(val, lookback)
+    lo = ta.lowest(val, lookback)
+    range_val = hi - lo
+    normalized = range_val == 0 ? 0.5 : (val - lo) / range_val
+    math.max(0.0, math.min(1.0, normalized))
+
+jma_approx(src, length, phase) =>
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    phaseRatio = math.max(0.01, phase)
+    alpha = math.pow(beta, math.pow(1.0 / phaseRatio, 2))
+    var float j = na
+    j := na(j[1]) ? src : alpha * src + (1 - alpha) * j[1]
+    j
+
+jma_func(_src, _length, _phase, _power) =>
+    phaseRatio = _phase < -100 ? 0.5 : _phase > 100 ? 2.5 : _phase / 100 + 1.5
+    beta  = 0.45 * (_length - 1) / (0.45 * (_length - 1) + 2)
+    alpha = math.pow(beta, _power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jv = na
+    e0 := (1 - alpha) * _src + alpha * nz(e0[1], _src)
+    e1 := (_src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jv[1], _src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jv  := e2 + nz(jv[1], _src)
+    jv
+
+iTrend_func(src, alpha) =>
+    var float it = na
+    it := (alpha - (alpha*alpha)/4) * src + 
+          0.5 * alpha * alpha * nz(src[1]) - 
+          (alpha - 0.75*alpha*alpha) * nz(src[2]) + 
+          2 * (1 - alpha) * nz(it[1]) - 
+          (1 - alpha) * (1 - alpha) * nz(it[2])
+    it
+
+efficiency_ratio(src, w) =>
+    path = 0.0
+    for i = 0 to w - 1
+        path += math.abs(src[i] - src[i+1])
+    disp = math.abs(src - src[w])
+    path := math.max(path, 1e-10)
+    eff = disp / path
+    math.max(0.0, math.min(1.0, eff))
+
+musashi_fdi(src, w, use_multiscale, ws, wl, lookback, weight_core, weight_entropy) =>
+    eff_med = efficiency_ratio(src, w)
+    eff = eff_med
+    if use_multiscale
+        eff_short = efficiency_ratio(src, ws)
+        eff_long  = efficiency_ratio(src, wl)
+        eff := 0.20 * eff_short + 0.60 * eff_med + 0.20 * eff_long
+    ent = shannon_entropy(src, w, 8)
+    ent_inv = 1.0 - ent
+    fused = weight_core * eff + weight_entropy * ent_inv
+    normalized = percentile_normalize(fused, lookback)
+    math.max(0.0, math.min(1.0, normalized))
+
+cfb_enhanced(src, shortW, medW, longW, lookback) =>
+    r2s = r_squared(src, shortW)
+    r2m = r_squared(src, medW)
+    r2l = r_squared(src, longW)
+    blended = 0.2 * r2s + 0.6 * r2m + 0.2 * r2l
+    normalized = percentile_normalize(blended, lookback)
+    math.max(0.0, math.min(1.0, normalized))
+
+kalman_filter(measurement, proc_noise, meas_noise) =>
+    var float state = na
+    var float velocity = 0.0
+    var float uncertainty = 1.0
+    if na(state)
+        state := measurement
+        uncertainty := 1.0
+        velocity := 0.0
+    predicted_state = state + velocity
+    predicted_uncertainty = uncertainty + proc_noise
+    innovation = measurement - predicted_state
+    innovation_uncertainty = predicted_uncertainty + meas_noise
+    kalman_gain = predicted_uncertainty / innovation_uncertainty
+    state := predicted_state + kalman_gain * innovation
+    velocity := velocity + kalman_gain * innovation * 0.5
+    uncertainty := (1 - kalman_gain) * predicted_uncertainty
+    residual = measurement - predicted_state
+    [state, velocity, uncertainty, residual]
+
+stress_detector(residual, lookback) =>
+    residuals = array.new_float(0)
+    for i = 0 to lookback - 1
+        array.push(residuals, residual[i])
+    n = array.size(residuals)
+    mean = array.avg(residuals)
+    variance = 0.0
+    for i = 0 to n - 1
+        dev = array.get(residuals, i) - mean
+        variance += dev * dev
+    variance := variance / n
+    std_dev = math.sqrt(math.max(variance, 1e-10))
+    skewness = 0.0
+    if std_dev > 1e-10
+        for i = 0 to n - 1
+            z = (array.get(residuals, i) - mean) / std_dev
+            skewness += z * z * z
+        skewness := skewness / n
+    kurtosis = 0.0
+    if std_dev > 1e-10
+        for i = 0 to n - 1
+            z = (array.get(residuals, i) - mean) / std_dev
+            kurtosis += z * z * z * z
+        kurtosis := kurtosis / n
+    excess_kurtosis = kurtosis - 3.0
+    skew_stress = math.min(math.abs(skewness) / 2.0, 1.0)
+    kurt_stress = math.min(math.abs(excess_kurtosis) / 3.0, 1.0)
+    stress = (skew_stress + kurt_stress) / 2.0
+    [skewness, excess_kurtosis, stress]
+
+kaufman_er(src, length) =>
+    change = math.abs(src - src[length])
+    volatility_sum = 0.0
+    for i = 0 to length - 1
+        volatility_sum += math.abs(src[i] - src[i + 1])
+    er = volatility_sum != 0 ? change / volatility_sum : 0.0
+    math.max(0.0, math.min(1.0, er))
+
+atr_ratio_volatility(atr_len, jma_len, jma_ph, jma_pw) =>
+    atr_val = ta.atr(atr_len)
+    atr_jma_avg = jma_func(atr_val, jma_len, jma_ph, jma_pw)
+    ratio = atr_jma_avg != 0 ? atr_val / atr_jma_avg : 1.0
+    ratio
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SHARED CALCULATIONS (USED BY BOTH ENGINES)
+// ═════════════════════════════════════════════════════════════════════════════
+
+src = close
+
+// Musashi FDI Core
+f_musashi = musashi_fdi(src, len_musashi, multiscale, len_musashi_short, len_musashi_long, 
+     adaptive_lookback, musashi_weight_core, musashi_weight_entropy)
+
+cfb_val = use_cfb ? cfb_enhanced(src, cfb_short, cfb_med, cfb_long, adaptive_lookback) : 0.0
+
+w_m = 0.75
+w_c = 0.25
+composite_raw = use_cfb ? (w_m * f_musashi + w_c * cfb_val) : f_musashi
+
+// JMA/iTrend (shared)
+jma = jma_func(close, jma_len, jma_phase, jma_power)
+jma_slope_raw = jma - jma[slope_len]
+jma_accel_raw = jma_slope_raw - jma_slope_raw[1]
+jma_accel = ta.ema(jma_accel_raw, accel_len)
+
+slope_pos = jma_slope_raw > 0
+accel_pos = jma_accel > 0
+
+jma_green  = slope_pos and accel_pos
+jma_yellow = slope_pos and not accel_pos
+jma_blue   = not slope_pos and accel_pos
+jma_red    = not slope_pos and not accel_pos
+
+iTrend = iTrend_func(close, itrend_alpha)
+jma_weakening = jma_accel < 0 or math.abs(jma_slope_raw) < math.abs(jma_slope_raw[1])
+iTrend_early_signal = ta.cross(iTrend, 0) and jma_weakening
+
+jma_color = iTrend_early_signal ? (iTrend > 0 ? col_weak_up : col_slowing_dn) : jma_green  ? col_strong_up : jma_yellow ? col_weak_up   : jma_blue   ? col_slowing_dn : col_down
+
+jma_bullish = slope_pos
+
+// ER (shared)
+independent_er = kaufman_er(src, er_length)
+er_fast = jma_func(independent_er, er_fast_length, er_jma_phase, er_jma_power)
+er_slow = jma_func(independent_er, er_slow_length, er_jma_phase, er_jma_power)
+
+er_rising = er_fast > er_slow
+er_falling = er_fast < er_slow
+er_strong = independent_er > er_strong_thr and er_rising
+er_elite = independent_er > er_elite_thr
+
+// ATR (shared)
+atr_ratio = atr_ratio_volatility(atr_length, atr_jma_length, atr_jma_phase, atr_jma_power)
+vol_compressed = atr_ratio < vol_compressed_thr
+
+// Microstructure (for Advanced only)
+float vol_surge_score = 50.0
+if enable_micro
+    vol_avg = ta.sma(volume, vol_accel_len)
+    vol_surge = volume > (vol_avg * vol_surge_mult)
+    vol_surge_bullish = vol_surge and close > open
+    vol_surge_score := vol_surge_bullish ? 100.0 : 50.0
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SIMPLE ENGINE (FRE-STYLE)
+// ═════════════════════════════════════════════════════════════════════════════
+
+simple_score = jma_approx(composite_raw, jma_fre_len, jma_fre_phase)
+simple_regime = simple_score >= trend_thr_base ? "TREND" : simple_score <= range_thr_base ? "RANGE" : "TRANSITION"
+
+// Simple confidence (3 factors)
+simple_threshold_distance = simple_regime == "TREND" ? (simple_score - trend_thr_base) / (1.0 - trend_thr_base) : simple_regime == "RANGE" ? (range_thr_base - simple_score) / range_thr_base : 0.5
+simple_threshold_distance := math.max(0.0, math.min(1.0, simple_threshold_distance))
+
+simple_vol_confidence = atr_ratio < vol_compressed_thr ? 1.0 : atr_ratio > vol_expanded_thr ? 0.5 : 0.8
+
+simple_confidence = (0.50 * simple_threshold_distance) + (0.40 * independent_er) + (0.10 * simple_vol_confidence)
+simple_confidence := math.max(0.0, math.min(1.0, simple_confidence))
+
+// Simple state
+var string simple_state = "NO_TRADE"
+
+if not jma_bullish
+    simple_state := "NO_TRADE"
+else if simple_regime == "TREND" and er_falling
+    simple_state := "EXHAUSTION"
+else if simple_regime == "TREND" and er_elite and simple_confidence >= elite_confidence
+    simple_state := "ELITE"
+else if simple_regime == "TREND" and er_strong and simple_confidence >= min_confidence
+    simple_state := "TREND"
+else if jma_bullish and er_rising and vol_compressed and simple_score > (range_thr_base + 0.10)
+    simple_state := "IGNITION"
+else
+    simple_state := "NO_TRADE"
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  ADVANCED ENGINE (URS-STYLE)
+// ═════════════════════════════════════════════════════════════════════════════
+
+[kalman_state, kalman_velocity, kalman_uncertainty, kalman_residual] = kalman_filter(composite_raw, process_noise, measurement_noise)
+
+[skewness, excess_kurtosis, stress_score] = stress_detector(kalman_residual, stress_lookback)
+
+stress_level = stress_score < stress_low ? "STABLE" :
+               stress_score < stress_medium ? "WATCH" :
+               stress_score < stress_high ? "CAUTION" : "STRESS"
+
+// Adaptive thresholds
+float adv_trend_thr = trend_thr_base
+float adv_range_thr = range_thr_base
+
+if adaptive_thresholds
+    stress_adjustment = stress_score * 0.15
+    uncertainty_adjustment = kalman_uncertainty * 0.10
+    adv_trend_thr := trend_thr_base + stress_adjustment + uncertainty_adjustment
+    adv_range_thr := range_thr_base - stress_adjustment - uncertainty_adjustment
+
+advanced_regime = kalman_state >= adv_trend_thr ? "TREND" :
+                  kalman_state <= adv_range_thr ? "RANGE" : "TRANSITION"
+
+// Advanced confidence (4 factors)
+adv_threshold_distance = advanced_regime == "TREND" ? (kalman_state - adv_trend_thr) / (1.0 - adv_trend_thr) :
+                         advanced_regime == "RANGE" ? (adv_range_thr - kalman_state) / adv_range_thr : 0.5
+adv_threshold_distance := math.max(0.0, math.min(1.0, adv_threshold_distance))
+
+adv_vol_confidence = atr_ratio < vol_compressed_thr ? 1.0 : atr_ratio > vol_expanded_thr ? 0.5 : 0.8
+stress_confidence = 1.0 - stress_score
+
+advanced_confidence = (0.35 * adv_threshold_distance) + (0.35 * independent_er) + 
+                      (0.15 * adv_vol_confidence) + (0.15 * stress_confidence)
+advanced_confidence := math.max(0.0, math.min(1.0, advanced_confidence))
+
+// Advanced state
+var string advanced_state = "NO_TRADE"
+
+if not jma_bullish
+    advanced_state := "NO_TRADE"
+else if advanced_regime == "TREND" and er_falling
+    advanced_state := "EXHAUSTION"
+else if advanced_regime == "TREND" and er_elite and advanced_confidence >= elite_confidence
+    advanced_state := "ELITE"
+else if advanced_regime == "TREND" and er_strong and advanced_confidence >= min_confidence
+    advanced_state := "TREND"
+else if jma_bullish and er_rising and vol_compressed and kalman_state > (adv_range_thr + 0.10)
+    advanced_state := "IGNITION"
+else
+    advanced_state := "NO_TRADE"
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  CONSENSUS LOGIC
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Helper: is state tradeable?
+is_tradeable(state) =>
+    state == "ELITE" or state == "TREND" or state == "IGNITION"
+
+simple_tradeable = is_tradeable(simple_state)
+advanced_tradeable = is_tradeable(advanced_state)
+
+// Unified output state
+var string unified_state = "FLAT"
+var string trigger_source = "NONE"
+
+if consensus_mode == "SIMPLE ONLY"
+    if simple_state == "ELITE"
+        unified_state := "LONG ELITE"
+        trigger_source := "SIMPLE"
+    else if simple_state == "TREND"
+        unified_state := "LONG STRONG"
+        trigger_source := "SIMPLE"
+    else if simple_state == "IGNITION"
+        unified_state := "LONG EARLY"
+        trigger_source := "SIMPLE"
+    else if simple_state == "EXHAUSTION"
+        unified_state := "EXIT WARNING"
+        trigger_source := "SIMPLE"
+    else
+        unified_state := "FLAT"
+        trigger_source := "NONE"
+
+else if consensus_mode == "ADVANCED ONLY"
+    if advanced_state == "ELITE"
+        unified_state := "LONG ELITE"
+        trigger_source := "ADVANCED"
+    else if advanced_state == "TREND"
+        unified_state := "LONG STRONG"
+        trigger_source := "ADVANCED"
+    else if advanced_state == "IGNITION"
+        unified_state := "LONG EARLY"
+        trigger_source := "ADVANCED"
+    else if advanced_state == "EXHAUSTION"
+        unified_state := "EXIT WARNING"
+        trigger_source := "ADVANCED"
+    else
+        unified_state := "FLAT"
+        trigger_source := "NONE"
+
+else if consensus_mode == "BOTH"
+    // BOTH engines must show tradeable state
+    if simple_tradeable and advanced_tradeable
+        // Prioritize highest quality state
+        if simple_state == "ELITE" or advanced_state == "ELITE"
+            unified_state := "LONG ELITE"
+            trigger_source := simple_state == "ELITE" and advanced_state == "ELITE" ? "BOTH" :
+                             simple_state == "ELITE" ? "SIMPLE" : "ADVANCED"
+        else if simple_state == "TREND" or advanced_state == "TREND"
+            unified_state := "LONG STRONG"
+            trigger_source := "BOTH"
+        else
+            unified_state := "LONG EARLY"
+            trigger_source := "BOTH"
+    else if simple_state == "EXHAUSTION" or advanced_state == "EXHAUSTION"
+        unified_state := "EXIT WARNING"
+        trigger_source := simple_state == "EXHAUSTION" ? "SIMPLE" : "ADVANCED"
+    else
+        unified_state := "FLAT"
+        trigger_source := "NONE"
+
+else  // EITHER
+    // Either engine shows tradeable state
+    if simple_tradeable or advanced_tradeable
+        // Prioritize highest quality state
+        if simple_state == "ELITE" or advanced_state == "ELITE"
+            unified_state := "LONG ELITE"
+            trigger_source := simple_state == "ELITE" and advanced_state == "ELITE" ? "BOTH" :
+                             simple_state == "ELITE" ? "SIMPLE" : "ADVANCED"
+        else if simple_state == "TREND" or advanced_state == "TREND"
+            unified_state := "LONG STRONG"
+            trigger_source := simple_state == "TREND" and advanced_state == "TREND" ? "BOTH" :
+                             simple_state == "TREND" ? "SIMPLE" : "ADVANCED"
+        else
+            unified_state := "LONG EARLY"
+            trigger_source := simple_state == "IGNITION" and advanced_state == "IGNITION" ? "BOTH" :
+                             simple_state == "IGNITION" ? "SIMPLE" : "ADVANCED"
+    else if simple_state == "EXHAUSTION" or advanced_state == "EXHAUSTION"
+        unified_state := "EXIT WARNING"
+        trigger_source := simple_state == "EXHAUSTION" and advanced_state == "EXHAUSTION" ? "BOTH" :
+                         simple_state == "EXHAUSTION" ? "SIMPLE" : "ADVANCED"
+    else
+        unified_state := "FLAT"
+        trigger_source := "NONE"
+
+// Strength calculation (use best of both)
+simple_strength = simple_score * 0.4 + independent_er * 0.4 + (jma_green ? 1.0 : jma_yellow ? 0.7 : 0.3) * 0.2
+advanced_strength = kalman_state * 0.3 + independent_er * 0.3 + (jma_green ? 1.0 : jma_yellow ? 0.7 : 0.3) * 0.2 + (1.0 - stress_score) * 0.1 + (vol_surge_score / 100.0) * 0.1
+
+unified_strength = consensus_mode == "SIMPLE ONLY" ? simple_strength :
+                   consensus_mode == "ADVANCED ONLY" ? advanced_strength :
+                   math.max(simple_strength, advanced_strength)
+
+unified_strength := math.max(0.0, math.min(1.0, unified_strength))
+
+dynamic_opacity = use_dynamic_opacity ? int(base_opacity - (unified_strength * (base_opacity - strong_opacity))) : base_opacity
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  DIVERGENCE DETECTION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Find pivots in price and regime scores
+pivot_high_price = ta.pivothigh(close, divergence_pivot_len, divergence_pivot_len)
+pivot_high_simple = ta.pivothigh(simple_score, divergence_pivot_len, divergence_pivot_len)
+pivot_high_advanced = ta.pivothigh(kalman_state, divergence_pivot_len, divergence_pivot_len)
+
+pivot_low_price = ta.pivotlow(close, divergence_pivot_len, divergence_pivot_len)
+pivot_low_simple = ta.pivotlow(simple_score, divergence_pivot_len, divergence_pivot_len)
+pivot_low_advanced = ta.pivotlow(kalman_state, divergence_pivot_len, divergence_pivot_len)
+
+// Bearish divergences (price higher, score lower = weakening momentum)
+bear_div_simple = enable_divergence and not na(pivot_high_price) and not na(pivot_high_simple) and
+     close[divergence_pivot_len] > close[divergence_pivot_len + divergence_lookback] and 
+     simple_score[divergence_pivot_len] < simple_score[divergence_pivot_len + divergence_lookback]
+
+bear_div_advanced = enable_divergence and not na(pivot_high_price) and not na(pivot_high_advanced) and
+     close[divergence_pivot_len] > close[divergence_pivot_len + divergence_lookback] and 
+     kalman_state[divergence_pivot_len] < kalman_state[divergence_pivot_len + divergence_lookback]
+
+// Bullish divergences (price lower, score higher = strengthening momentum)
+bull_div_simple = enable_divergence and not na(pivot_low_price) and not na(pivot_low_simple) and
+     close[divergence_pivot_len] < close[divergence_pivot_len + divergence_lookback] and 
+     simple_score[divergence_pivot_len] > simple_score[divergence_pivot_len + divergence_lookback]
+
+bull_div_advanced = enable_divergence and not na(pivot_low_price) and not na(pivot_low_advanced) and
+     close[divergence_pivot_len] < close[divergence_pivot_len + divergence_lookback] and 
+     kalman_state[divergence_pivot_len] > kalman_state[divergence_pivot_len + divergence_lookback]
+
+// Combined divergences based on consensus mode
+bearish_divergence = consensus_mode == "SIMPLE ONLY" ? bear_div_simple :
+                     consensus_mode == "ADVANCED ONLY" ? bear_div_advanced :
+                     consensus_mode == "BOTH" ? (bear_div_simple and bear_div_advanced) :
+                     (bear_div_simple or bear_div_advanced)  // EITHER
+
+bullish_divergence = consensus_mode == "SIMPLE ONLY" ? bull_div_simple :
+                     consensus_mode == "ADVANCED ONLY" ? bull_div_advanced :
+                     consensus_mode == "BOTH" ? (bull_div_simple and bull_div_advanced) :
+                     (bull_div_simple or bull_div_advanced)  // EITHER
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  PLOTTING
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Engine scores
+plot(show_dual_plots ? simple_score : na, "Simple Engine", color=col_simple_line, linewidth=2)
+plot(show_dual_plots ? kalman_state : na, "Advanced Engine", color=col_advanced_line, linewidth=2)
+
+// JMA directional
+jma_normalized = percentile_normalize(jma, 100)
+plot(jma_normalized, "JMA Direction", color=jma_color, linewidth=2)
+
+// Threshold lines
+plot(trend_thr_base, "Trend Threshold", color=color.new(color.green, 0), style=plot.style_circles, linewidth=1)
+plot(range_thr_base, "Range Threshold", color=color.new(color.red, 0), style=plot.style_circles, linewidth=1)
+plot(0.5, "Midpoint", color=color.new(color.gray, 50), style=plot.style_circles, linewidth=1)
+
+// Threshold zones
+p_top = plot(1.0, display=display.none)
+p_mid_high = plot(trend_thr_base, display=display.none)
+p_mid_low = plot(range_thr_base, display=display.none)
+p_bottom = plot(0.0, display=display.none)
+
+fill(p_mid_high, p_top, color=show_zones ? color.new(color.green, 92) : na, title="Trend Zone")
+fill(p_mid_low, p_bottom, color=show_zones ? color.new(color.red, 92) : na, title="Range Zone")
+
+// UNIFIED BACKGROUND COLOR (LONG-ONLY GATED)
+unified_bg_color = unified_state == "LONG ELITE" ? col_long_elite :
+                   unified_state == "LONG STRONG" ? col_long_strong :
+                   unified_state == "LONG EARLY" ? col_long_early :
+                   unified_state == "EXIT WARNING" ? col_exit_warning :
+                   col_flat
+
+show_bg = long_only_mode ? jma_bullish : true
+final_bg_color = show_bg ? color.new(unified_bg_color, dynamic_opacity) : na
+
+bgcolor(final_bg_color, title="Unified Output")
+
+// SIGNAL MARKERS
+show_marker = long_only_mode ? jma_bullish : true
+
+elite_signal = unified_state == "LONG ELITE" and unified_state[1] != "LONG ELITE"
+strong_signal = unified_state == "LONG STRONG" and unified_state[1] != "LONG STRONG"
+early_signal = unified_state == "LONG EARLY" and unified_state[1] != "LONG EARLY"
+exit_signal = unified_state == "EXIT WARNING" and unified_state[1] != "EXIT WARNING"
+
+// Elite marker with glow
+plotshape(show_markers and show_marker and elite_signal, title="Elite Glow", location=location.bottom, 
+     style=shape.diamond, size=size.huge, color=color.new(color.yellow, 75))
+plotshape(show_markers and show_marker and elite_signal, title="Elite Signal", location=location.bottom, 
+     style=shape.diamond, size=size.large, color=color.new(color.yellow, 0), text="ELITE", textcolor=color.black)
+
+// Strong marker
+plotshape(show_markers and show_marker and strong_signal and barstate.isconfirmed, title="Strong Signal", 
+     location=location.bottom, style=shape.triangleup, size=size.small, color=color.green)
+
+// Early marker
+plotshape(show_markers and show_marker and early_signal and barstate.isconfirmed, title="Early Signal", 
+     location=location.bottom, style=shape.circle, size=size.tiny, color=color.yellow)
+
+// Exit marker
+plotshape(show_markers and show_marker and exit_signal and barstate.isconfirmed, title="Exit Warning", 
+     location=location.top, style=shape.xcross, size=size.small, color=color.orange)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  METRICS TABLE
+// ═════════════════════════════════════════════════════════════════════════════
+
+if show_values and barstate.islast
+    var table t = table.new(position.top_right, 3, 14, border_width=1, border_color=color.gray)
+    
+    // Header
+    table.cell(t, 0, 0, "URE v2", text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+    table.cell(t, 1, 0, "SIMPLE", text_color=color.white, bgcolor=color.new(col_simple_line, 30), text_size=size.small)
+    table.cell(t, 2, 0, "ADVANCED", text_color=color.white, bgcolor=color.new(col_advanced_line, 30), text_size=size.small)
+    
+    // Unified Output
+    table.cell(t, 0, 1, "OUTPUT", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.normal)
+    table.cell(t, 1, 1, unified_state, text_color=color.white, bgcolor=unified_bg_color, text_size=size.large)
+    table.cell(t, 2, 1, unified_state, text_color=color.white, bgcolor=unified_bg_color, text_size=size.large)
+    
+    // Trigger Source
+    table.cell(t, 0, 2, "Trigger", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    trigger_color = trigger_source == "BOTH" ? color.purple : trigger_source == "SIMPLE" ? col_simple_line : trigger_source == "ADVANCED" ? col_advanced_line : color.gray
+    table.cell(t, 1, 2, trigger_source, text_color=color.white, bgcolor=trigger_color, text_size=size.small)
+    table.cell(t, 2, 2, consensus_mode, text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=size.small)
+    
+    // Engine States
+    table.cell(t, 0, 3, "State", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    simple_state_color = is_tradeable(simple_state) ? color.green : simple_state == "EXHAUSTION" ? color.orange : color.gray
+    table.cell(t, 1, 3, simple_state, text_color=color.white, bgcolor=simple_state_color, text_size=size.small)
+    advanced_state_color = is_tradeable(advanced_state) ? color.green : advanced_state == "EXHAUSTION" ? color.orange : color.gray
+    table.cell(t, 2, 3, advanced_state, text_color=color.white, bgcolor=advanced_state_color, text_size=size.small)
+    
+    // Regime
+    table.cell(t, 0, 4, "Regime", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    simple_regime_color = simple_regime == "TREND" ? color.green : simple_regime == "RANGE" ? color.red : color.orange
+    table.cell(t, 1, 4, simple_regime, text_color=color.white, bgcolor=simple_regime_color, text_size=size.small)
+    adv_regime_color = advanced_regime == "TREND" ? color.green : advanced_regime == "RANGE" ? color.red : color.orange
+    table.cell(t, 2, 4, advanced_regime, text_color=color.white, bgcolor=adv_regime_color, text_size=size.small)
+    
+    // Score
+    table.cell(t, 0, 5, "Score", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(t, 1, 5, str.tostring(simple_score, "#.##"), text_color=color.white, bgcolor=color.new(color.blue, 60), text_size=size.small)
+    table.cell(t, 2, 5, str.tostring(kalman_state, "#.##"), text_color=color.white, bgcolor=color.new(color.blue, 60), text_size=size.small)
+    
+    // Confidence
+    table.cell(t, 0, 6, "Conf", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    simple_conf_bg = simple_confidence >= elite_confidence ? color.green : simple_confidence >= min_confidence ? color.yellow : color.red
+    table.cell(t, 1, 6, str.tostring(simple_confidence * 100, "#") + "%", text_color=color.white, bgcolor=simple_conf_bg, text_size=size.small)
+    adv_conf_bg = advanced_confidence >= elite_confidence ? color.green : advanced_confidence >= min_confidence ? color.yellow : color.red
+    table.cell(t, 2, 6, str.tostring(advanced_confidence * 100, "#") + "%", text_color=color.white, bgcolor=adv_conf_bg, text_size=size.small)
+    
+    // JMA
+    table.cell(t, 0, 7, "JMA", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    jma_text = jma_green ? "STR UP" : jma_yellow ? "WK UP" : jma_blue ? "SLOW" : "DOWN"
+    jma_bg = jma_bullish ? color.green : color.red
+    table.cell(t, 1, 7, jma_text, text_color=color.white, bgcolor=jma_bg, text_size=size.small)
+    table.cell(t, 2, 7, jma_text, text_color=color.white, bgcolor=jma_bg, text_size=size.small)
+    
+    // ER
+    table.cell(t, 0, 8, "ER", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    er_dir = er_rising ? "↑" : er_falling ? "↓" : "→"
+    er_bg = er_strong ? color.green : color.gray
+    table.cell(t, 1, 8, str.tostring(independent_er, "#.##") + er_dir, text_color=color.white, bgcolor=er_bg, text_size=size.small)
+    table.cell(t, 2, 8, str.tostring(independent_er, "#.##") + er_dir, text_color=color.white, bgcolor=er_bg, text_size=size.small)
+    
+    // ATR
+    table.cell(t, 0, 9, "ATR", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    vol_status = vol_compressed ? "COMP" : atr_ratio > vol_expanded_thr ? "EXP" : "NORM"
+    vol_bg = vol_compressed ? color.blue : atr_ratio > vol_expanded_thr ? color.red : color.gray
+    table.cell(t, 1, 9, str.tostring(atr_ratio, "#.##"), text_color=color.white, bgcolor=vol_bg, text_size=size.small)
+    table.cell(t, 2, 9, vol_status, text_color=color.white, bgcolor=vol_bg, text_size=size.small)
+    
+    // Stress (Advanced only)
+    table.cell(t, 0, 10, "Stress", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(t, 1, 10, "—", text_color=color.gray, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    stress_bg = stress_score < stress_medium ? color.green : color.orange
+    table.cell(t, 2, 10, stress_level, text_color=color.white, bgcolor=stress_bg, text_size=size.small)
+    
+    // Vol Surge (Advanced only)
+    table.cell(t, 0, 11, "Vol", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(t, 1, 11, "—", text_color=color.gray, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    vol_text = vol_surge_score > 90 ? "SURGE" : "OK"
+    vol_color = vol_surge_score > 90 ? color.green : color.gray
+    table.cell(t, 2, 11, vol_text, text_color=color.white, bgcolor=vol_color, text_size=size.small)
+    
+    // Strength
+    table.cell(t, 0, 12, "Strength", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(t, 1, 12, str.tostring(simple_strength * 100, "#") + "%", text_color=color.white, bgcolor=color.new(color.purple, 60), text_size=size.small)
+    table.cell(t, 2, 12, str.tostring(advanced_strength * 100, "#") + "%", text_color=color.white, bgcolor=color.new(color.purple, 60), text_size=size.small)
+    
+    // Mode
+    table.cell(t, 0, 13, "Mode", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    mode_text = long_only_mode ? "LONG" : "BOTH"
+    mode_color = long_only_mode ? color.green : color.blue
+    table.cell(t, 1, 13, mode_text, text_color=color.white, bgcolor=mode_color, text_size=size.small)
+    table.cell(t, 2, 13, mode_text, text_color=color.white, bgcolor=mode_color, text_size=size.small)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+if unified_state != unified_state[1] and barstate.isconfirmed and show_marker
+    alert_msg = "URE v2: " + unified_state + " | Trigger: " + trigger_source + " | Mode: " + consensus_mode
+    alert(alert_msg, alert.freq_once_per_bar_close)
+
+if elite_signal and barstate.isconfirmed and show_marker
+    alert_msg = "⭐ ELITE SIGNAL | Trigger: " + trigger_source + " | S.Conf: " + str.tostring(simple_confidence * 100, "#") + 
+         "% | A.Conf: " + str.tostring(advanced_confidence * 100, "#") + "%"
+    alert(alert_msg, alert.freq_once_per_bar_close)
+
+
+// Divergence alerts
+if bearish_divergence and barstate.isconfirmed
+    alert("URE v2: Bearish Divergence - Potential reversal!", alert.freq_once_per_bar_close)
+
+if bullish_divergence and barstate.isconfirmed
+    alert("URE v2: Bullish Divergence - Potential reversal!", alert.freq_once_per_bar_close)

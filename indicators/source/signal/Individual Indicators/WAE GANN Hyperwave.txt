@@ -1,0 +1,991 @@
+//@version=5
+indicator("WAE/GANN + Hyperwave Combined", overlay=false, max_lines_count=500, max_labels_count=500)
+
+//════════════════════════════════════════════════════════════════════════════════
+// DISPLAY MODE SELECTION
+//════════════════════════════════════════════════════════════════════════════════
+displayMode = input.string("Combined", "Display Mode", 
+     options=["WAE/GANN Only", "Hyperwave Only", "Combined"], 
+     group="═══ Display Mode ═══")
+
+//════════════════════════════════════════════════════════════════════════════════
+// WAE/GANN SETTINGS
+//════════════════════════════════════════════════════════════════════════════════
+showWAE = input.bool(true, "Show WAE Indicator", group="WAE/GANN Display")
+showGANN = input.bool(true, "Show GANN Indicator", group="WAE/GANN Display")
+
+// === WAE Inputs ===
+sensitivity = input.int(7, title="WAE Sensitivity", group="WAE Settings")
+
+useAdaptiveCycle_wae = input.bool(true, title="Use Adaptive Cycle (Ehlers)", group="WAE Adaptive Cycle")
+minCycleLength_wae = input.int(5, title="Min Cycle Length", minval=1, group="WAE Adaptive Cycle")
+maxCycleLength_wae = input.int(16, title="Max Cycle Length", minval=1, group="WAE Adaptive Cycle")
+manualCycleLength_wae = input.int(8, title="Manual Cycle Length", minval=1, group="WAE Adaptive Cycle")
+
+volLength = input.int(title="Volatility JMA Base Length", defval=5, minval=1, group="WAE Volatility JMA (Fast)")
+volPhase_wae = input.int(title="Volatility JMA Phase", defval=50, minval=-100, maxval=100, group="WAE Volatility JMA (Fast)")
+volPower_wae = input.int(title="Volatility JMA Power", defval=2, minval=1, group="WAE Volatility JMA (Fast)")
+volatilityLength = input.int(title="Volatility Period", defval=7, minval=1, group="WAE Volatility JMA (Fast)")
+volCycleMultiplier_wae = input.float(title="Vol Cycle Multiplier", defval=1.0, minval=0.1, maxval=2.0, step=0.1, group="WAE Volatility JMA (Fast)")
+
+vwjmaLength = input.int(title="VW-JMA Base Length", defval=16, minval=1, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaPhase_wae = input.int(title="VW-JMA Phase", defval=50, minval=-100, maxval=100, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaPower_wae = input.int(title="VW-JMA Power", defval=2, minval=1, group="WAE Volume-Weighted JMA (Slow)")
+minVolumeThreshold_wae = input.float(title="Min Volume Threshold (% of avg)", defval=50.0, minval=0.1, maxval=100, group="WAE Volume-Weighted JMA (Slow)")
+useExtendedHours_wae = input.bool(title="Detect Extended Hours", defval=true, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaSmoothing_wae = input.int(title="VW-JMA Smoothing Period", defval=9, minval=1, maxval=10, group="WAE Volume-Weighted JMA (Slow)")
+vwjmaCycleMultiplier_wae = input.float(title="VW-JMA Cycle Multiplier", defval=1.0, minval=0.1, maxval=2.0, step=0.1, group="WAE Volume-Weighted JMA (Slow)")
+
+kernelLen = input.int(6, title="Kernel Length", minval=2, group="WAE Kernel Bands")
+kernelMult = input.float(2.618, title="Kernel Band Multiplier", minval=0.1, group="WAE Kernel Bands")
+
+// === GANN Inputs ===
+gann_src = input.source(close, "GANN Source", group="GANN Settings")
+angleLength = input.int(5, "Angle Length (Δ Price vs Time)", minval=1, group="GANN Settings")
+jmaLength_gann = input.int(16, "GANN JMA Length", minval=1, group="GANN Settings")
+jmaPhase_gann = input.float(1, "GANN JMA Phase", step=0.1, minval=-1, maxval=1, group="GANN Settings")
+
+useNormalization = input.bool(true, "Use Percentage Normalization", group="GANN Normalization")
+normFactor = input.float(100.0, "Normalization Factor", minval=1, group="GANN Normalization")
+
+signalMode = input.string("Both", "GANN Signal Type", 
+     options=["Zero Cross", "Pivot Inflection", "Both"], group="GANN Settings")
+
+showAngleLine = input.bool(true, "Show GANN Angle Line", group="GANN Visuals")
+showBars = input.bool(true, "Show GANN Angle Heatmap Bars", group="GANN Visuals")
+showSignals_gann = input.bool(true, "Show GANN Buy/Sell Signals", group="GANN Visuals")
+showZones = input.bool(true, "Show GANN Buy/Sell Zones", group="GANN Visuals")
+
+labelSize = input.string("Small", "GANN Label Size", 
+     options=["Tiny", "Small", "Normal", "Large"], group="GANN Visuals")
+
+//════════════════════════════════════════════════════════════════════════════════
+// HYPERWAVE SETTINGS
+//════════════════════════════════════════════════════════════════════════════════
+src_hw = input.source(close, "Source", group="Hyperwave Core")
+
+useMTF = input.bool(false, "Enable Multi-Timeframe Aroon", group="Hyperwave MTF Aroon")
+mtfTimeframe = input.timeframe("15", "MTF Timeframe", group="Hyperwave MTF Aroon")
+mtfWeight = input.float(0.3, "MTF Weight", minval=0.0, maxval=1.0, step=0.05, group="Hyperwave MTF Aroon")
+showMTFLine = input.bool(true, "Show MTF Aroon Line", group="Hyperwave MTF Aroon")
+showMTFDivergence = input.bool(true, "Show MTF Divergence Alerts", group="Hyperwave MTF Aroon")
+
+useAdaptiveCycle_hw = input.bool(true, "Use Adaptive Cycle", group="Hyperwave Adaptive Cycle")
+minCycleLength_hw = input.int(3, "Min Cycle Length", minval=1, group="Hyperwave Adaptive Cycle")
+maxCycleLength_hw = input.int(16, "Max Cycle Length", minval=1, group="Hyperwave Adaptive Cycle")
+manualCycleLength_hw = input.int(6, "Manual Cycle Length", minval=1, group="Hyperwave Adaptive Cycle")
+
+useCyclicOnAroon = input.bool(true, "Apply Cyclic Smoothing to Aroon", group="Hyperwave Cyclic Smoothing")
+vibration_input = input.float(6, "Vibration", minval=1, group="Hyperwave Cyclic Smoothing")
+
+jmaLength_hw = input.int(5, "Price JMA Base Length", group="Hyperwave Price JMA")
+volPhase_hw = input.int(50, "Price JMA Phase", minval=-100, maxval=100, group="Hyperwave Price JMA")
+volPower_hw = input.int(2, "Price JMA Power", minval=1, maxval=4, group="Hyperwave Price JMA")
+volatilityLength_hw = input.int(7, "Volatility Period", minval=1, group="Hyperwave Price JMA")
+volCycleMultiplier_hw = input.float(1, "Vol Cycle Multiplier", minval=0.1, maxval=2.0, step=0.1, group="Hyperwave Price JMA")
+
+baseLength = input.int(16, "Base JMA Base Length", group="Hyperwave Base JMA")
+vwjmaPhase_hw = input.int(30, "Base JMA Phase", minval=-100, maxval=100, group="Hyperwave Base JMA")
+vwjmaPower_hw = input.int(4, "Base JMA Power", minval=1, maxval=4, group="Hyperwave Base JMA")
+minVolumeThreshold_hw = input.float(50.0, "Min Volume Threshold (% of avg)", minval=0.1, maxval=100, group="Hyperwave Base JMA")
+useExtendedHours_hw = input.bool(true, "Detect Extended Hours", group="Hyperwave Base JMA")
+vwjmaSmoothing_hw = input.int(9, "CVD-RVWAP Smoothing Period", minval=1, maxval=10, group="Hyperwave Base JMA")
+vwjmaCycleMultiplier_hw = input.float(1.0, "CVD-RVWAP Cycle Multiplier", minval=0.1, maxval=2.0, step=0.1, group="Hyperwave Base JMA")
+
+vol_mult = input.float(1, "Volatility Multiplier", group="Hyperwave Volatility")
+mad_length = input.int(7, "MAD Length", minval=1, group="Hyperwave Volatility")
+
+aroon_length = input.int(5, title="Aroon Base Length", group="Hyperwave Aroon")
+aroon_jma_len = input.int(5, title="Aroon JMA Length", group="Hyperwave Aroon")
+aroon_phase = input.int(30, title="Aroon JMA Phase", minval=-100, maxval=100, group="Hyperwave Aroon")
+aroon_power = input.int(4, title="Aroon JMA Power", minval=1, group="Hyperwave Aroon")
+aroonCycleMultiplier = input.float(1.0, "Aroon Cycle Multiplier", minval=0.1, maxval=2.0, step=0.1, group="Hyperwave Aroon")
+useIFT_in = input.bool(true, "Apply Input IFT", group="Hyperwave Aroon")
+outIFT_scale = input.float(1, "Output IFT Scale", minval=0.01, maxval=10.0, step=0.01, group="Hyperwave Aroon")
+
+sigLen = input.int(16, "Signal Length", minval=2, group="Hyperwave Aroon Bands")
+sigPhase = input.int(100, "Signal Phase", minval=-100, maxval=100, group="Hyperwave Aroon Bands")
+sigPower = input.int(4, "Signal Power", minval=1, maxval=4, group="Hyperwave Aroon Bands")
+bmult = input.float(1.0, 'Band Multiplier (MAD)', step=0.1, group="Hyperwave Aroon Bands")
+cblen = input.bool(false, 'Custom Band Length?', group="Hyperwave Aroon Bands")
+rms_blen = input.int(20, 'Custom Band Length', minval=1, group="Hyperwave Aroon Bands")
+
+mean_dev_len_line = input.int(10, "Mean Dev Length", minval=5, group="Hyperwave Aroon Line")
+base_jma_len_line = input.int(5, "Base JMA Length", minval=1, group="Hyperwave Aroon Line")
+min_jma_len_line = input.int(3, "Min JMA Length", minval=1, group="Hyperwave Aroon Line")
+max_jma_len_line = input.int(7, "Max JMA Length", minval=1, group="Hyperwave Aroon Line")
+aroon_jma_phase_line = input.int(50, "Pre JMA Phase", minval=-100, maxval=100, group="Hyperwave Aroon Line")
+aroon_jma_power_line = input.int(4, "Pre JMA Power", minval=1, maxval=4, group="Hyperwave Aroon Line")
+
+itrend_alpha = input.float(0.07, "ITrend alpha (a)", group="Hyperwave ITrend", step=0.01)
+itrend_coh_win = input.int(16, "ITrend coherence window", group="Hyperwave ITrend")
+
+show_zones_hw = input.bool(true, "Show Volatility Zones", group="Hyperwave Display")
+show_momentum = input.bool(true, "Show Aroon Info Panel", group="Hyperwave Display")
+show_hw_line = input.bool(true, "Show Hyperwave Line (scaled)", group="Hyperwave Display")
+show_aroon_regime = input.bool(true, "Show Aroon Regime Colors", group="Hyperwave Display")
+show_jma_cross = input.bool(true, "Show JMA Cross Background", group="Hyperwave Display")
+show_cvd_mode = input.bool(true, "Show CVD-RVWAP Mode Indicator", group="Hyperwave Display")
+show_cycle_info = input.bool(true, "Show Cycle Info in Data Window", group="Hyperwave Display")
+hysteresis_bars = input.int(1, "Regime Confirmation Bars", group="Hyperwave Display")
+mixJ = input.float(0.35, "JMADev weight in Hyperwave (0..1)", step=0.05, group="Hyperwave Display")
+th_up = input.float(0.10, "Hyperwave Up Threshold", step=0.05, group="Hyperwave Display")
+th_dn = input.float(-0.10, "Hyperwave Down Threshold", step=0.05, group="Hyperwave Display")
+
+hw_scale_mult = input.float(2.0, "Hyperwave Visual Scale Multiplier", group="Hyperwave Scaling", step=0.5)
+aroon_scale_mult = input.float(1.0, "Aroon Weight Visual Scale Multiplier", group="Hyperwave Scaling", step=0.5)
+
+//════════════════════════════════════════════════════════════════════════════════
+// SHARED HELPER FUNCTIONS
+//════════════════════════════════════════════════════════════════════════════════
+jma_func(src_val, length, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jma_val = na
+    e0 := (1 - alpha) * src_val + alpha * nz(e0[1], src_val)
+    e1 := (src_val - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jma_val[1], src_val)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jma_val := e2 + nz(jma_val[1], src_val)
+    jma_val
+
+ehlersDominantCycle(src_val, minCycle, maxCycle) =>
+    var float smooth = na
+    smooth := (4 * src_val + 3 * nz(src_val[1]) + 2 * nz(src_val[2]) + nz(src_val[3])) / 10
+    
+    var float i1 = 0.0
+    var float q1 = 0.0
+    var float i2 = 0.0
+    var float q2 = 0.0
+    var float re = 0.0
+    var float im = 0.0
+    
+    i1 := nz(smooth[3])
+    q1 := (smooth - nz(smooth[6])) / 2.0
+    
+    i2 := 0.2 * i1 + 0.8 * nz(i2[1])
+    q2 := 0.2 * q1 + 0.8 * nz(q2[1])
+    
+    re := 0.2 * (i2 * nz(i2[1]) + q2 * nz(q2[1])) + 0.8 * nz(re[1])
+    im := 0.2 * (i2 * nz(q2[1]) - q2 * nz(i2[1])) + 0.8 * nz(im[1])
+    
+    period = im != 0 and re != 0 ? 2 * math.pi / math.atan(im / re) : 0
+    period := period < minCycle ? minCycle : period > maxCycle ? maxCycle : period
+    
+    var float smoothPeriod = na
+    smoothPeriod := 0.33 * period + 0.67 * nz(smoothPeriod[1], period)
+    
+    math.round(smoothPeriod)
+
+gaussianKernel(x, bandwidth) => 
+    math.exp(-math.pow(x, 2) / (bandwidth * bandwidth * 2))
+
+kernelRegression(src_val, kernelLen_val) =>
+    sum = 0.0
+    sumw = 0.0
+    for i = 0 to kernelLen_val - 1
+        weight = gaussianKernel(i, kernelLen_val)
+        sum += src_val[i] * weight
+        sumw += weight
+    sumw != 0 ? sum / sumw : na
+
+//════════════════════════════════════════════════════════════════════════════════
+// WAE/GANN CALCULATIONS
+//════════════════════════════════════════════════════════════════════════════════
+
+// === Calculate Adaptive Cycle Length for WAE ===
+dominantCycle_wae = ehlersDominantCycle(close, minCycleLength_wae, maxCycleLength_wae)
+baseCycle_wae = useAdaptiveCycle_wae ? dominantCycle_wae : manualCycleLength_wae
+
+adaptiveVolLength_wae = math.round(baseCycle_wae * volCycleMultiplier_wae)
+adaptiveVWJMALength_wae = math.round(baseCycle_wae * vwjmaCycleMultiplier_wae)
+
+// === DEAD_ZONE calculation ===
+DEAD_ZONE = ta.rma(ta.tr(true), 100) * 3.7
+
+// === VOLATILITY JMA (FAST) for WAE ===
+median_wae = ta.median(close, volatilityLength)
+mad_wae = ta.median(math.abs(close - median_wae), volatilityLength)
+volatility_wae = mad_wae * 1.4826
+volatility_wae := na(volatility_wae) or volatility_wae == 0 ? 1 : volatility_wae
+volatilityWeight_wae = volatility_wae / ta.ema(volatility_wae, volatilityLength)
+weightedSrc_wae = close * volatilityWeight_wae
+
+volPhaseRatio_wae = volPhase_wae < -100 ? 0.5 : volPhase_wae > 100 ? 2.5 : volPhase_wae / 100 + 1.5
+volBeta_wae = 0.45 * (adaptiveVolLength_wae - 1) / (0.45 * (adaptiveVolLength_wae - 1) + 2)
+volAlpha_wae = math.pow(volBeta_wae, volPower_wae)
+
+var float vol_e0_vw_wae = 0.0
+vol_e0_vw_wae := (1 - volAlpha_wae) * weightedSrc_wae + volAlpha_wae * vol_e0_vw_wae
+
+var float vol_e1_vw_wae = 0.0
+vol_e1_vw_wae := (weightedSrc_wae - vol_e0_vw_wae) * (1 - volBeta_wae) + volBeta_wae * vol_e1_vw_wae
+
+var float vol_e2_vw_wae = 0.0
+var float vol_jma_vw_wae = 0.0
+vol_e2_vw_wae := (vol_e0_vw_wae + volPhaseRatio_wae * vol_e1_vw_wae - vol_jma_vw_wae) * math.pow(1 - volAlpha_wae, 2) + math.pow(volAlpha_wae, 2) * vol_e2_vw_wae
+vol_jma_vw_wae := vol_e2_vw_wae + vol_jma_vw_wae
+
+var float vol_e0_vol_wae = 0.0
+vol_e0_vol_wae := (1 - volAlpha_wae) * volatilityWeight_wae + volAlpha_wae * vol_e0_vol_wae
+
+var float vol_e1_vol_wae = 0.0
+vol_e1_vol_wae := (volatilityWeight_wae - vol_e0_vol_wae) * (1 - volBeta_wae) + volBeta_wae * vol_e1_vol_wae
+
+var float vol_e2_vol_wae = 0.0
+var float vol_jma_vol_wae = 0.0
+vol_e2_vol_wae := (vol_e0_vol_wae + volPhaseRatio_wae * vol_e1_vol_wae - vol_jma_vol_wae) * math.pow(1 - volAlpha_wae, 2) + math.pow(volAlpha_wae, 2) * vol_e2_vol_wae
+vol_jma_vol_wae := vol_e2_vol_wae + vol_jma_vol_wae
+
+volatilityJMA_wae = vol_jma_vol_wae != 0 ? vol_jma_vw_wae / vol_jma_vol_wae : close
+
+// === CVD CALCULATION for WAE ===
+deltaVolume_wae = close > open ? volume : close < open ? -volume : 0
+var float cvd_wae = 0.0
+cvd_wae += deltaVolume_wae
+
+// === CVD-RVWAP JMA (SLOW) for WAE ===
+isExtendedHours_wae_flag = useExtendedHours_wae ? not na(time(timeframe.period, "0930-1600", "America/New_York")) == false : false
+
+avgVolume_wae = ta.sma(volume, adaptiveVWJMALength_wae * 2)
+volThreshold_wae = avgVolume_wae * (minVolumeThreshold_wae / 100.0)
+isLowVolume_wae = volume < volThreshold_wae or isExtendedHours_wae_flag
+
+volumeStdev_wae = ta.stdev(volume, adaptiveVWJMALength_wae)
+volumeChange_wae = math.abs(volume - volume[1])
+isErraticVolume_wae = volumeStdev_wae > 0 and volumeChange_wae > (volumeStdev_wae * 3)
+
+useRegularJMA_wae = isLowVolume_wae or isErraticVolume_wae
+
+regularJMA_wae = jma_func(close, adaptiveVWJMALength_wae, vwjmaPhase_wae, vwjmaPower_wae)
+
+cvdPhaseRatio_wae = vwjmaPhase_wae < -100 ? 0.5 : vwjmaPhase_wae > 100 ? 2.5 : vwjmaPhase_wae / 100 + 1.5
+cvdBeta_wae = 0.45 * (adaptiveVWJMALength_wae - 1) / (0.45 * (adaptiveVWJMALength_wae - 1) + 2)
+cvdAlpha_wae = math.pow(cvdBeta_wae, vwjmaPower_wae)
+
+maxVolume_wae = avgVolume_wae * 5
+minVolume_wae = avgVolume_wae * 0.1
+clampedVolume_wae = math.max(minVolume_wae, math.min(volume, maxVolume_wae))
+
+normalizedVolume_wae = clampedVolume_wae > 0 ? clampedVolume_wae : 1.0
+cvdWeight_wae = cvd_wae != 0 ? (1 + (deltaVolume_wae / math.max(math.abs(cvd_wae), volume))) : 1.0
+cvdWeightedVolume_wae = normalizedVolume_wae * cvdWeight_wae
+
+rvwapPrice_wae = close * cvdWeightedVolume_wae
+smoothVol_wae = cvdWeightedVolume_wae
+
+var float cvd_e0_vw_wae = 0.0
+cvd_e0_vw_wae := (1 - cvdAlpha_wae) * rvwapPrice_wae + cvdAlpha_wae * cvd_e0_vw_wae
+
+var float cvd_e1_vw_wae = 0.0
+cvd_e1_vw_wae := (rvwapPrice_wae - cvd_e0_vw_wae) * (1 - cvdBeta_wae) + cvdBeta_wae * cvd_e1_vw_wae
+
+var float cvd_e2_vw_wae = 0.0
+var float cvd_jma_numerator_wae = 0.0
+cvd_e2_vw_wae := (cvd_e0_vw_wae + cvdPhaseRatio_wae * cvd_e1_vw_wae - cvd_jma_numerator_wae) * math.pow(1 - cvdAlpha_wae, 2) + math.pow(cvdAlpha_wae, 2) * cvd_e2_vw_wae
+cvd_jma_numerator_wae := cvd_e2_vw_wae + cvd_jma_numerator_wae
+
+var float cvd_e0_vol_wae = 0.0
+cvd_e0_vol_wae := (1 - cvdAlpha_wae) * smoothVol_wae + cvdAlpha_wae * cvd_e0_vol_wae
+
+var float cvd_e1_vol_wae = 0.0
+cvd_e1_vol_wae := (smoothVol_wae - cvd_e0_vol_wae) * (1 - cvdBeta_wae) + cvdBeta_wae * cvd_e1_vol_wae
+
+var float cvd_e2_vol_wae = 0.0
+var float cvd_jma_denominator_wae = 0.0
+cvd_e2_vol_wae := (cvd_e0_vol_wae + cvdPhaseRatio_wae * cvd_e1_vol_wae - cvd_jma_denominator_wae) * math.pow(1 - cvdAlpha_wae, 2) + math.pow(cvdAlpha_wae, 2) * cvd_e2_vol_wae
+cvd_jma_denominator_wae := cvd_e2_vol_wae + cvd_jma_denominator_wae
+
+cvdRVWAPJMA_raw_wae = cvd_jma_denominator_wae != 0 ? cvd_jma_numerator_wae / cvd_jma_denominator_wae : close
+
+priceDeviation_wae = math.abs(cvdRVWAPJMA_raw_wae - close) / close
+isTooDeviated_wae = priceDeviation_wae > 0.05
+
+cvdRVWAPJMA_temp_wae = (useRegularJMA_wae or isTooDeviated_wae) ? regularJMA_wae : cvdRVWAPJMA_raw_wae
+
+smoothingAlpha_wae = 2.0 / (vwjmaSmoothing_wae + 1)
+var float cvdRVWAPJMA_wae = na
+cvdRVWAPJMA_wae := na(cvdRVWAPJMA_wae) ? cvdRVWAPJMA_temp_wae : smoothingAlpha_wae * cvdRVWAPJMA_temp_wae + (1 - smoothingAlpha_wae) * cvdRVWAPJMA_wae
+
+if useRegularJMA_wae
+    extraSmoothing_wae = 2.0 / (vwjmaSmoothing_wae * 2 + 1)
+    cvdRVWAPJMA_wae := extraSmoothing_wae * cvdRVWAPJMA_temp_wae + (1 - extraSmoothing_wae) * cvdRVWAPJMA_wae
+
+// === MACD for WAE ===
+macd_value_wae = volatilityJMA_wae - cvdRVWAPJMA_wae
+macd_value_prev_wae = volatilityJMA_wae[1] - cvdRVWAPJMA_wae[1]
+t1 = (macd_value_wae - macd_value_prev_wae) * sensitivity
+
+// === Kernel Bands for WAE ===
+kr_mean = kernelRegression(close, kernelLen)
+kr_dev = 0.0
+sumw = 0.0
+for i = 0 to kernelLen - 1
+    weight = gaussianKernel(i, kernelLen)
+    kr_dev += math.abs(close[i] - kr_mean) * weight
+    sumw += weight
+kr_dev := sumw != 0 ? kr_dev / sumw : na
+
+kr_upper = kr_mean + kernelMult * kr_dev
+kr_lower = kr_mean - kernelMult * kr_dev
+e1 = kr_upper - kr_lower
+
+// === Trend determination for WAE ===
+trendUp = (t1 >= 0) ? t1 : 0
+trendDown = (t1 < 0) ? -t1 : 0
+
+//────────────────────────────────────────────────────────────
+// GANN CALCULATIONS
+//────────────────────────────────────────────────────────────
+jma_gann(src_val, length, phase) =>
+    var float e0 = 0.0
+    var float e1 = 0.0
+    var float e2 = 0.0
+
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2.0)
+    alpha = math.pow(beta, 2)
+
+    e0 := (1 - alpha) * src_val + alpha * nz(e0[1], src_val)
+    e1 := (src_val - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := e0 + phase * e1
+    e2
+
+slopeRaw = useNormalization ? ((gann_src - gann_src[angleLength]) / gann_src[angleLength]) * normFactor / angleLength : (gann_src - gann_src[angleLength]) / angleLength
+
+angleRaw = math.atan(slopeRaw) * (180 / math.pi)
+angleSmoothed = jma_gann(angleRaw, jmaLength_gann, jmaPhase_gann)
+
+anglePrev1 = angleSmoothed[1]
+anglePrev2 = angleSmoothed[2]
+
+zeroCrossUp = ta.crossover(angleSmoothed, 0)
+zeroCrossDown = ta.crossunder(angleSmoothed, 0)
+
+pivotUp = anglePrev1 < anglePrev2 and angleSmoothed > anglePrev1
+pivotDown = anglePrev1 > anglePrev2 and angleSmoothed < anglePrev1
+
+signalBuy =
+     (signalMode == "Zero Cross" and zeroCrossUp) or
+     (signalMode == "Pivot Inflection" and pivotUp) or
+     (signalMode == "Both" and (zeroCrossUp or pivotUp))
+
+signalSell =
+     (signalMode == "Zero Cross" and zeroCrossDown) or
+     (signalMode == "Pivot Inflection" and pivotDown) or
+     (signalMode == "Both" and (zeroCrossDown or pivotDown))
+
+var int gann_tradeState = 0
+
+if signalBuy
+    gann_tradeState := 1
+else if signalSell
+    gann_tradeState := -1
+else
+    gann_tradeState := nz(gann_tradeState[1], 0)
+
+//════════════════════════════════════════════════════════════════════════════════
+// WAE/GANN COMBINED SIGNALS
+//════════════════════════════════════════════════════════════════════════════════
+combinedEntrySignal = trendUp > DEAD_ZONE and gann_tradeState == 1
+combinedExitSignal = trendDown > DEAD_ZONE and gann_tradeState == -1
+
+//════════════════════════════════════════════════════════════════════════════════
+// HYPERWAVE CALCULATIONS
+//════════════════════════════════════════════════════════════════════════════════
+
+// Helper functions for Hyperwave
+clamp(x, lo, hi) => math.max(lo, math.min(x, hi))
+
+rolling_median(src_val, len) =>
+    float out = na
+    if bar_index >= len - 1
+        var float[] a = array.new_float(0)
+        array.clear(a)
+        for i = 0 to len - 1
+            array.push(a, src_val[i])
+        array.sort(a)
+        mid = math.floor(len / 2)
+        out := (len % 2 == 1) ? array.get(a, mid) : (array.get(a, mid - 1) + array.get(a, mid)) / 2.0
+    out
+
+rolling_mad(src_val, len) =>
+    med = rolling_median(src_val, len)
+    if na(med)
+        na
+    else
+        var float[] a = array.new_float(0)
+        array.clear(a)
+        for i = 0 to len - 1
+            array.push(a, math.abs(src_val[i] - med))
+        array.sort(a)
+        mid = math.floor(len / 2)
+        mad_val = (len % 2 == 1) ? array.get(a, mid) : (array.get(a, mid - 1) + array.get(a, mid)) / 2.0
+        mad_val * 1.4826
+
+jma_hw(src_val, length_, phase_, power_) =>
+    phaseRatio = phase_ < -100 ? 0.5 : phase_ > 100 ? 2.5 : phase_ / 100 + 1.5
+    beta = 0.45 * (length_ - 1) / (0.45 * (length_ - 1) + 2)
+    alphaJMA = math.pow(beta, power_)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jma_val = na
+    e0 := (1 - alphaJMA) * src_val + alphaJMA * nz(e0[1], src_val)
+    e1 := (src_val - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jma_val[1], src_val)) * math.pow(1 - alphaJMA, 2) + math.pow(alphaJMA, 2) * nz(e2[1], 0)
+    jma_val := e2 + nz(jma_val[1], src_val)
+    jma_val
+
+tanh(x) =>
+    ex = math.exp(2 * x)
+    (ex - 1) / (ex + 1)
+
+// Aroon calculation function
+calculate_aroon(src_input, cycle_len, use_cyclic, vib, fixed_cycle) =>
+    mean_dev_line = ta.stdev(src_input, mean_dev_len_line)
+    max_dev_line = math.max(1e-10, ta.highest(mean_dev_line, 100))
+    adaptive_jma_len_line = base_jma_len_line * (mean_dev_line / max_dev_line)
+    adaptive_jma_len_line := math.max(min_jma_len_line, math.min(math.round(adaptive_jma_len_line), max_jma_len_line))
+    aroon_input_line = jma_hw(src_input, adaptive_jma_len_line, aroon_jma_phase_line, aroon_jma_power_line)
+    
+    aroon_up_raw = 100.0 * (ta.highestbars(high, cycle_len + 1) + cycle_len) / cycle_len
+    aroon_dn_raw = 100.0 * (ta.lowestbars(low, cycle_len + 1) + cycle_len) / cycle_len
+    aroon_osc_base = aroon_up_raw - aroon_dn_raw
+    
+    float aroon_osc_raw = aroon_osc_base
+    if use_cyclic
+        float aroon_torque = 2.0 / (vib + 1)
+        int aroon_phasingLag = int(math.round((vib - 1) / 2.0))
+        
+        float aroon_up_change = ta.rma(math.max(ta.change(aroon_input_line), 0), fixed_cycle)
+        float aroon_down_change = ta.rma(-math.min(ta.change(aroon_input_line), 0), fixed_cycle)
+        
+        float aroon_temp = aroon_down_change == 0 ? 100.0 : aroon_up_change == 0 ? -100.0 : (aroon_up_change - aroon_down_change) / (aroon_up_change + aroon_down_change) * 100.0
+        
+        var float aroon_cyclic = 0.0
+        aroon_cyclic := aroon_torque * (2 * aroon_temp - nz(aroon_temp[aroon_phasingLag])) + (1 - aroon_torque) * nz(aroon_cyclic[1])
+        
+        aroon_osc_raw := aroon_cyclic
+    
+    aroon_dom = jma_hw(aroon_osc_raw, aroon_jma_len, aroon_phase, aroon_power)
+    
+    aroon_target_base = aroon_dom / 100
+    aroon_target_ift = (math.exp(2 * (0.1 * aroon_dom)) - 1) / (math.exp(2 * (0.1 * aroon_dom)) + 1)
+    aroon_normalized = useIFT_in ? nz(aroon_target_ift) : nz(aroon_target_base)
+    
+    xout = clamp(outIFT_scale * aroon_normalized, -5.0, 5.0)
+    aroonDisplay = (math.exp(2 * xout) - 1) / (math.exp(2 * xout) + 1)
+    
+    maDisplay = jma_hw(aroonDisplay, sigLen, sigPhase, sigPower)
+    mad_len_band = cblen ? rms_blen : sigLen
+    abs_dev = math.abs(aroonDisplay - maDisplay)
+    mad_band = jma_hw(abs_dev, mad_len_band, sigPhase, sigPower)
+    upper_mad = bmult * mad_band
+    lower_mad = -bmult * mad_band
+    
+    aroon_regime_out = aroonDisplay > upper_mad ? 1 : aroonDisplay < lower_mad ? -1 : 0
+    
+    aroonWeightBase = (aroonDisplay + 1.0) / 2.0
+    aroonWeight_out = aroon_regime_out == 1 ? math.max(aroonWeightBase, 0.7) : 
+                      aroon_regime_out == -1 ? math.min(aroonWeightBase, 0.3) : 
+                      aroonWeightBase
+    
+    [aroonDisplay, aroon_regime_out, aroonWeight_out, aroon_osc_raw, upper_mad, lower_mad]
+
+// Adaptive cycle for Hyperwave
+dominantCycle_hw = ehlersDominantCycle(close, minCycleLength_hw, maxCycleLength_hw)
+baseCycle_hw = useAdaptiveCycle_hw ? dominantCycle_hw : manualCycleLength_hw
+
+adaptiveVolLength_hw = math.round(baseCycle_hw * volCycleMultiplier_hw)
+adaptiveVWJMALength_hw = math.round(baseCycle_hw * vwjmaCycleMultiplier_hw)
+adaptiveAroonLength = math.round(baseCycle_hw * aroonCycleMultiplier)
+
+fixedCycleLen = int(maxCycleLength_hw / 2)
+
+// Volatility JMA for Hyperwave
+volatility_hw = rolling_mad(close, volatilityLength_hw)
+volatility_hw := na(volatility_hw) or volatility_hw == 0 ? ta.atr(volatilityLength_hw) : volatility_hw
+
+volatilityWeight_hw = volatility_hw / ta.ema(volatility_hw, volatilityLength_hw)
+weightedSrc_hw = close * volatilityWeight_hw
+
+volPhaseRatio_hw = volPhase_hw < -100 ? 0.5 : volPhase_hw > 100 ? 2.5 : volPhase_hw / 100 + 1.5
+volBeta_hw = 0.45 * (adaptiveVolLength_hw - 1) / (0.45 * (adaptiveVolLength_hw - 1) + 2)
+volAlpha_hw = math.pow(volBeta_hw, volPower_hw)
+
+var float vol_e0_vw_hw = 0.0
+vol_e0_vw_hw := (1 - volAlpha_hw) * weightedSrc_hw + volAlpha_hw * vol_e0_vw_hw
+
+var float vol_e1_vw_hw = 0.0
+vol_e1_vw_hw := (weightedSrc_hw - vol_e0_vw_hw) * (1 - volBeta_hw) + volBeta_hw * vol_e1_vw_hw
+
+var float vol_e2_vw_hw = 0.0
+var float vol_jma_vw_hw = 0.0
+vol_e2_vw_hw := (vol_e0_vw_hw + volPhaseRatio_hw * vol_e1_vw_hw - vol_jma_vw_hw) * math.pow(1 - volAlpha_hw, 2) + math.pow(volAlpha_hw, 2) * vol_e2_vw_hw
+vol_jma_vw_hw := vol_e2_vw_hw + vol_jma_vw_hw
+
+var float vol_e0_vol_hw = 0.0
+vol_e0_vol_hw := (1 - volAlpha_hw) * volatilityWeight_hw + volAlpha_hw * vol_e0_vol_hw
+
+var float vol_e1_vol_hw = 0.0
+vol_e1_vol_hw := (volatilityWeight_hw - vol_e0_vol_hw) * (1 - volBeta_hw) + volBeta_hw * vol_e1_vol_hw
+
+var float vol_e2_vol_hw = 0.0
+var float vol_jma_vol_hw = 0.0
+vol_e2_vol_hw := (vol_e0_vol_hw + volPhaseRatio_hw * vol_e1_vol_hw - vol_jma_vol_hw) * math.pow(1 - volAlpha_hw, 2) + math.pow(volAlpha_hw, 2) * vol_e2_vol_hw
+vol_jma_vol_hw := vol_e2_vol_hw + vol_jma_vol_hw
+
+volatilityJMA_base_hw = vol_jma_vol_hw != 0 ? vol_jma_vw_hw / vol_jma_vol_hw : close
+priceJMA = volatilityJMA_base_hw
+
+// CVD calculation for Hyperwave
+deltaVolume_hw = close > open ? volume : close < open ? -volume : 0
+var float cvd_hw = 0.0
+cvd_hw += deltaVolume_hw
+
+// CVD-RVWAP JMA for Hyperwave
+isExtendedHours_hw_flag = useExtendedHours_hw ? not na(time(timeframe.period, "0930-1600", "America/New_York")) == false : false
+
+avgVolume_hw = ta.sma(volume, adaptiveVWJMALength_hw * 2)
+volThreshold_hw = avgVolume_hw * (minVolumeThreshold_hw / 100.0)
+isLowVolume_hw = volume < volThreshold_hw or isExtendedHours_hw_flag
+
+volumeStdev_hw = ta.stdev(volume, adaptiveVWJMALength_hw)
+volumeChange_hw = math.abs(volume - volume[1])
+isErraticVolume_hw = volumeStdev_hw > 0 and volumeChange_hw > (volumeStdev_hw * 3)
+
+useRegularJMA_hw = isLowVolume_hw or isErraticVolume_hw
+regularJMA_hw = jma_hw(close, adaptiveVWJMALength_hw, vwjmaPhase_hw, vwjmaPower_hw)
+
+cvdPhaseRatio_hw = vwjmaPhase_hw < -100 ? 0.5 : vwjmaPhase_hw > 100 ? 2.5 : vwjmaPhase_hw / 100 + 1.5
+cvdBeta_hw = 0.45 * (adaptiveVWJMALength_hw - 1) / (0.45 * (adaptiveVWJMALength_hw - 1) + 2)
+cvdAlpha_hw = math.pow(cvdBeta_hw, vwjmaPower_hw)
+
+maxVolume_hw = avgVolume_hw * 5
+minVolume_hw = avgVolume_hw * 0.1
+clampedVolume_hw = math.max(minVolume_hw, math.min(volume, maxVolume_hw))
+
+normalizedVolume_hw = clampedVolume_hw > 0 ? clampedVolume_hw : 1.0
+cvdWeight_hw = cvd_hw != 0 ? (1 + (deltaVolume_hw / math.max(math.abs(cvd_hw), volume))) : 1.0
+cvdWeightedVolume_hw = normalizedVolume_hw * cvdWeight_hw
+
+rvwapPrice_hw = close * cvdWeightedVolume_hw
+smoothVol_hw = cvdWeightedVolume_hw
+
+var float cvd_e0_vw_hw = 0.0
+cvd_e0_vw_hw := (1 - cvdAlpha_hw) * rvwapPrice_hw + cvdAlpha_hw * cvd_e0_vw_hw
+
+var float cvd_e1_vw_hw = 0.0
+cvd_e1_vw_hw := (rvwapPrice_hw - cvd_e0_vw_hw) * (1 - cvdBeta_hw) + cvdBeta_hw * cvd_e1_vw_hw
+
+var float cvd_e2_vw_hw = 0.0
+var float cvd_jma_numerator_hw = 0.0
+cvd_e2_vw_hw := (cvd_e0_vw_hw + cvdPhaseRatio_hw * cvd_e1_vw_hw - cvd_jma_numerator_hw) * math.pow(1 - cvdAlpha_hw, 2) + math.pow(cvdAlpha_hw, 2) * cvd_e2_vw_hw
+cvd_jma_numerator_hw := cvd_e2_vw_hw + cvd_jma_numerator_hw
+
+var float cvd_e0_vol_hw = 0.0
+cvd_e0_vol_hw := (1 - cvdAlpha_hw) * smoothVol_hw + cvdAlpha_hw * cvd_e0_vol_hw
+
+var float cvd_e1_vol_hw = 0.0
+cvd_e1_vol_hw := (smoothVol_hw - cvd_e0_vol_hw) * (1 - cvdBeta_hw) + cvdBeta_hw * cvd_e1_vol_hw
+
+var float cvd_e2_vol_hw = 0.0
+var float cvd_jma_denominator_hw = 0.0
+cvd_e2_vol_hw := (cvd_e0_vol_hw + cvdPhaseRatio_hw * cvd_e1_vol_hw - cvd_jma_denominator_hw) * math.pow(1 - cvdAlpha_hw, 2) + math.pow(cvdAlpha_hw, 2) * cvd_e2_vol_hw
+cvd_jma_denominator_hw := cvd_e2_vol_hw + cvd_jma_denominator_hw
+
+cvdRVWAPJMA_raw_hw = cvd_jma_denominator_hw != 0 ? cvd_jma_numerator_hw / cvd_jma_denominator_hw : close
+
+priceDeviation_hw = math.abs(cvdRVWAPJMA_raw_hw - close) / close
+isTooDeviated_hw = priceDeviation_hw > 0.05
+
+cvdRVWAPJMA_temp_hw = (useRegularJMA_hw or isTooDeviated_hw) ? regularJMA_hw : cvdRVWAPJMA_raw_hw
+
+smoothingAlpha_hw = 2.0 / (vwjmaSmoothing_hw + 1)
+var float cvdRVWAPJMA_base_hw = na
+cvdRVWAPJMA_base_hw := na(cvdRVWAPJMA_base_hw) ? cvdRVWAPJMA_temp_hw : smoothingAlpha_hw * cvdRVWAPJMA_temp_hw + (1 - smoothingAlpha_hw) * cvdRVWAPJMA_base_hw
+
+if useRegularJMA_hw
+    extraSmoothing_hw = 2.0 / (vwjmaSmoothing_hw * 2 + 1)
+    cvdRVWAPJMA_base_hw := extraSmoothing_hw * cvdRVWAPJMA_temp_hw + (1 - extraSmoothing_hw) * cvdRVWAPJMA_base_hw
+
+baseJMA = cvdRVWAPJMA_base_hw
+
+// Volatility (MAD-based)
+vol_hw = rolling_mad(src_hw, mad_length)
+vol_hw := na(vol_hw) or vol_hw == 0 ? ta.atr(mad_length) : vol_hw
+
+upper_band = baseJMA + vol_hw * vol_mult
+lower_band = baseJMA - vol_hw * vol_mult
+jmaDev = vol_hw != 0 ? (priceJMA - baseJMA) / vol_hw : 0
+
+// Current timeframe Aroon
+[aroonDisplay, aroon_regime, aroonWeight_base, aroon_osc_raw_hw, upper_mad_hw, lower_mad_hw] = 
+     calculate_aroon(close, adaptiveAroonLength, useCyclicOnAroon, vibration_input, fixedCycleLen)
+
+aroonWeight_sm = ta.ema(aroonWeight_base, math.max(1, math.round(sigLen/3)))
+
+// Multi-timeframe Aroon
+[mtf_aroonDisplay, mtf_aroon_regime, mtf_aroonWeight_base, mtf_aroon_osc_raw, mtf_upper_mad, mtf_lower_mad] = 
+     request.security(syminfo.tickerid, mtfTimeframe, 
+         calculate_aroon(close, adaptiveAroonLength, useCyclicOnAroon, vibration_input, fixedCycleLen), 
+         lookahead=barmerge.lookahead_off)
+
+mtf_aroonWeight_sm = ta.ema(mtf_aroonWeight_base, math.max(1, math.round(sigLen/3)))
+
+// Blend MTF and current timeframe
+float final_aroonWeight = aroonWeight_sm
+float final_aroonDisplay = aroonDisplay
+int final_aroon_regime = aroon_regime
+
+if useMTF
+    final_aroonWeight := (1 - mtfWeight) * aroonWeight_sm + mtfWeight * mtf_aroonWeight_sm
+    final_aroonDisplay := (1 - mtfWeight) * aroonDisplay + mtfWeight * mtf_aroonDisplay
+    
+    if mtf_aroon_regime == 1 and aroon_regime != -1
+        final_aroon_regime := 1
+    else if mtf_aroon_regime == -1 and aroon_regime != 1
+        final_aroon_regime := -1
+    else
+        final_aroon_regime := aroon_regime
+
+mtf_divergence = useMTF and showMTFDivergence and (
+     (mtf_aroon_regime == 1 and aroon_regime == -1) or 
+     (mtf_aroon_regime == -1 and aroon_regime == 1))
+
+// ITrend
+var float it = na
+a = itrend_alpha
+it := (a - ((a*a)/4.0)) * src_hw + 0.5*a*a*src_hw[1] - (a - 0.75*a*a)*src_hw[2] + 2*(1-a)*nz(it[1], ((src_hw + 2*src_hw[1] + src_hw[2])/4.0)) - (1-a)*(1-a)*nz(it[2], ((src_hw + 2*src_hw[1] + src_hw[2])/4.0))
+
+itrend_slope = it - it[1]
+itrend_dist = src_hw - it
+itrend_coh = math.abs(ta.correlation(src_hw, it, itrend_coh_win))
+slope_norm = (itrend_slope - ta.sma(itrend_slope, itrend_coh_win)) / math.max(ta.stdev(itrend_slope, itrend_coh_win), 1e-10)
+dist_norm = (itrend_dist - ta.sma(itrend_dist, itrend_coh_win)) / math.max(ta.stdev(itrend_dist, itrend_coh_win), 1e-10)
+itrendOsc = tanh(0.7*slope_norm + 0.3*dist_norm) * itrend_coh
+
+// Hyperwave
+hw_jma_component = jmaDev * final_aroonWeight
+hw_raw = mixJ * hw_jma_component + (1 - mixJ) * itrendOsc
+hw = ta.ema(hw_raw, math.max(1, math.round(jmaLength_hw/4)))
+
+hw_adjusted = hw * (1 + 0.2 * final_aroon_regime)
+
+// Hyperwave Regime
+var int hw_regime = 0
+cand = hw_adjusted > th_up ? 1 : hw_adjusted < th_dn ? -1 : 0
+if cand != hw_regime
+    ok = true
+    for i = 0 to hysteresis_bars - 1
+        if ((cand==1 and hw_adjusted[i]<=th_up) or (cand==-1 and hw_adjusted[i]>=th_dn))
+            ok := false
+    if ok
+        hw_regime := cand
+
+// JMA Cross condition
+jma_cross_condition = priceJMA > baseJMA
+
+//════════════════════════════════════════════════════════════════════════════════
+// COMBINED BAR COLOR LOGIC (Per Excel Specifications)
+//════════════════════════════════════════════════════════════════════════════════
+
+// Determine Hyperwave color state
+hw_color_green = hw_regime == 1
+hw_color_red = hw_regime == -1
+hw_color_grey = hw_regime == 0
+
+// Track JMA Cross zones - detect NEW JMA Cross
+var bool in_jma_cross_zone = false
+bool new_jma_cross = false
+
+if jma_cross_condition and not jma_cross_condition[1]
+    // New JMA Cross started
+    new_jma_cross := true
+    in_jma_cross_zone := true
+else if not jma_cross_condition
+    in_jma_cross_zone := false
+
+// Track if we've already seen a bright green entry in this JMA Cross zone
+var bool had_entry_in_zone = false
+
+if new_jma_cross
+    had_entry_in_zone := false
+else if not in_jma_cross_zone
+    had_entry_in_zone := false
+
+// Check if this is the FIRST bright green entry in the current JMA Cross zone
+bool is_first_entry_in_cross = false
+
+if in_jma_cross_zone and hw_color_green and combinedEntrySignal and not had_entry_in_zone
+    is_first_entry_in_cross := true
+    had_entry_in_zone := true
+
+// Determine bar color based on Excel logic
+color combined_bar_color = na
+
+if jma_cross_condition
+    // JMA Cross TRUE
+    if hw_color_green
+        if combinedEntrySignal
+            // First entry in JMA Cross zone = WHITE, subsequent = Bright Green
+            combined_bar_color := is_first_entry_in_cross ? color.new(color.white, 0) : color.new(color.lime, 0)
+        else if combinedExitSignal
+            combined_bar_color := color.new(color.yellow, 0)  // Yellow
+        else
+            combined_bar_color := color.new(color.green, 30)  // Dark Green
+    else if hw_color_red
+        if combinedEntrySignal
+            combined_bar_color := color.new(color.green, 30)  // Dark Green
+        else if combinedExitSignal
+            combined_bar_color := color.new(color.purple, 0)  // Purple
+        else
+            combined_bar_color := color.new(color.green, 30)  // Dark Green
+    else  // hw_color_grey
+        if combinedEntrySignal
+            combined_bar_color := color.new(color.lime, 0)  // Bright Green
+        else if combinedExitSignal
+            combined_bar_color := color.new(color.purple, 0)  // Purple
+        else
+            combined_bar_color := color.new(color.green, 30)  // Dark Green
+else
+    // No JMA Cross
+    if hw_color_green
+        if combinedEntrySignal
+            combined_bar_color := color.new(color.lime, 0)  // Bright Green
+        else if combinedExitSignal
+            combined_bar_color := color.new(color.green, 30)  // Dark Green
+        else
+            combined_bar_color := na  // No Color
+    else if hw_color_red
+        if combinedEntrySignal
+            combined_bar_color := color.new(color.purple, 0)  // Purple
+        else if combinedExitSignal
+            combined_bar_color := color.new(color.fuchsia, 0)  // Pink
+        else
+            combined_bar_color := color.new(color.purple, 0)  // Purple
+    else  // hw_color_grey
+        if combinedEntrySignal
+            combined_bar_color := na  // No Color
+        else if combinedExitSignal
+            combined_bar_color := color.new(color.purple, 0)  // Purple
+        else
+            combined_bar_color := na  // No Color
+
+//════════════════════════════════════════════════════════════════════════════════
+// DISPLAY LOGIC BASED ON MODE
+//════════════════════════════════════════════════════════════════════════════════
+
+show_wae_plots = displayMode == "WAE/GANN Only" or displayMode == "Combined"
+show_hw_plots = displayMode == "Hyperwave Only" or displayMode == "Combined"
+show_combined_colors = displayMode == "Combined"
+
+//════════════════════════════════════════════════════════════════════════════════
+// PLOTS - WAE SECTION
+//════════════════════════════════════════════════════════════════════════════════
+
+plot(show_wae_plots and showWAE and displayMode != "Combined" ? trendUp : na, style=plot.style_columns, linewidth=1, 
+     color=(trendUp<trendUp[1])?color.new(color.lime, 45):color.new(color.green, 45), title="WAE UpTrend")
+plot(show_wae_plots and showWAE and displayMode != "Combined" ? trendDown : na, style=plot.style_columns, linewidth=1, 
+     color=(trendDown<trendDown[1])?color.new(color.orange, 45):color.new(color.red, 45), title="WAE DownTrend")
+plot(show_wae_plots and showWAE and displayMode != "Combined" ? e1 : na, style=plot.style_line, linewidth=2, color=#A0522D, title="WAE ExplosionLine")
+plot(show_wae_plots and showWAE and displayMode != "Combined" ? DEAD_ZONE : na, color=color.blue, linewidth=1, style=plot.style_cross, title="WAE DeadZoneLine")
+
+//════════════════════════════════════════════════════════════════════════════════
+// PLOTS - GANN SECTION
+//════════════════════════════════════════════════════════════════════════════════
+
+lineColor_gann = angleSmoothed >= 0 ? color.new(color.green, 0) : color.new(color.red, 0)
+
+waeMax = math.max(ta.highest(trendUp, 100), ta.highest(trendDown, 100), ta.highest(e1, 100), DEAD_ZONE)
+gannMax = math.max(math.abs(ta.highest(angleSmoothed, 100)), math.abs(ta.lowest(angleSmoothed, 100)))
+scaleFactor_gann = gannMax > 0 ? (waeMax * 0.5) / gannMax : 1
+
+scaledAngle = show_wae_plots and showGANN ? angleSmoothed * scaleFactor_gann : na
+
+plot(show_wae_plots and showGANN and showAngleLine and displayMode != "Combined" ? scaledAngle : na, 
+     "GANN Angle (JMA)", color=lineColor_gann, linewidth=2)
+
+barColor_gann = angleSmoothed >= 0 ? color.new(color.green, 40) : color.new(color.red, 40)
+
+plot(show_wae_plots and showGANN and showBars and displayMode != "Combined" ? scaledAngle : na, 
+     "GANN Angle Heatmap", style=plot.style_columns, color=barColor_gann)
+
+hline(0, "Zero Line", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+
+lblSize_gann = labelSize == "Tiny" ? size.tiny :
+          labelSize == "Small" ? size.small :
+          labelSize == "Normal" ? size.normal :
+                                  size.large
+
+if show_wae_plots and showGANN and showSignals_gann and signalBuy and displayMode != "Combined"
+    label.new(bar_index, scaledAngle, "BUY",
+         style=label.style_label_up,
+         color=color.new(color.green, 0),
+         textcolor=color.white,
+         size=lblSize_gann)
+
+if show_wae_plots and showGANN and showSignals_gann and signalSell and displayMode != "Combined"
+    label.new(bar_index, scaledAngle, "SELL",
+         style=label.style_label_down,
+         color=color.new(color.red, 0),
+         textcolor=color.white,
+         size=lblSize_gann)
+
+//════════════════════════════════════════════════════════════════════════════════
+// PLOTS - HYPERWAVE SECTION
+//════════════════════════════════════════════════════════════════════════════════
+
+// Plot Hyperwave oscillator directly (not scaled to price) - hide in Combined mode
+hw_line_col = hw_regime==1 ? color.new(color.green, 0) : hw_regime==-1 ? color.new(color.red, 0) : color.new(color.gray, 30)
+plot(show_hw_plots and show_hw_line and displayMode != "Combined" ? hw_adjusted : na, "Hyperwave", color=hw_line_col, linewidth=2, style=plot.style_line)
+
+// Plot Aroon weight as oscillator - hide in Combined mode
+plot(show_hw_plots and show_aroon_regime and displayMode != "Combined" ? (final_aroonWeight - 0.5) * 2 : na, "Aroon Weight", color=color.new(color.blue, 50), linewidth=1)
+
+// Plot thresholds - hide in Combined mode
+hline(displayMode != "Combined" ? th_up : na, "HW Up Threshold", color=color.new(color.green, 50), linestyle=hline.style_dashed)
+hline(displayMode != "Combined" ? th_dn : na, "HW Down Threshold", color=color.new(color.red, 50), linestyle=hline.style_dashed)
+
+// MTF Aroon - plot as separate line - hide in Combined mode
+mtf_plot_col = mtf_aroon_regime == 1 ? color.new(color.green, 30) : mtf_aroon_regime == -1 ? color.new(color.red, 30) : color.new(color.gray, 70)
+plot(show_hw_plots and useMTF and showMTFLine and displayMode != "Combined" ? (mtf_aroonWeight_sm - 0.5) * 2 : na, "MTF Aroon Weight", color=mtf_plot_col, linewidth=1, style=plot.style_circles)
+
+plotshape(show_hw_plots and mtf_divergence and displayMode != "Combined", "MTF Divergence", shape.diamond, location.top, color.new(color.yellow, 0), size=size.tiny)
+
+//════════════════════════════════════════════════════════════════════════════════
+// COMBINED MODE - Bar Color Columns Only
+//════════════════════════════════════════════════════════════════════════════════
+
+// Create a value to plot as columns - use a constant value scaled to look good
+combined_column_value = displayMode == "Combined" ? 1.0 : na
+
+plot(combined_column_value, "Combined Signal", style=plot.style_columns, color=combined_bar_color, linewidth=3, title="Combined Columns")
+
+//════════════════════════════════════════════════════════════════════════════════
+// BACKGROUND COLORS - Calculated first, then applied globally
+//════════════════════════════════════════════════════════════════════════════════
+
+// WAE/GANN mode backgrounds
+color bg_gann_zones = (displayMode == "WAE/GANN Only" and showZones and gann_tradeState == 1) ? color.new(color.green, 92) : 
+                      (displayMode == "WAE/GANN Only" and showZones and gann_tradeState == -1) ? color.new(color.red, 92) : na
+
+color bg_wae_regular_jma = (displayMode == "WAE/GANN Only" and useRegularJMA_wae) ? color.new(color.orange, 90) : na
+
+color bg_wae_extended_hours = (displayMode == "WAE/GANN Only" and isExtendedHours_wae_flag) ? color.new(color.purple, 95) : na
+
+color bg_wae_combined_entry = (displayMode == "WAE/GANN Only" and combinedEntrySignal) ? color.new(color.green, 75) : na
+
+color bg_wae_combined_exit = (displayMode == "WAE/GANN Only" and combinedExitSignal) ? color.new(color.red, 75) : na
+
+// Hyperwave mode backgrounds
+jma_cross_bg_hw = show_jma_cross and priceJMA > baseJMA ? color.new(color.white, 93) : na
+
+bg_color_hw = hw_regime==1 and final_aroon_regime==1 ? color.new(color.green, 88) : 
+              hw_regime==1 and final_aroon_regime!=1 ? color.new(color.green, 94) : 
+              hw_regime==-1 and final_aroon_regime==-1 ? color.new(color.red, 88) : 
+              hw_regime==-1 and final_aroon_regime!=-1 ? color.new(color.red, 94) : na
+
+color bg_hw_jma_cross = (displayMode == "Hyperwave Only") ? jma_cross_bg_hw : na
+
+color bg_hw_aroon_regime = (displayMode == "Hyperwave Only") ? 
+     (show_aroon_regime ? bg_color_hw : (hw_regime==1 ? color.new(color.green,92) : hw_regime==-1 ? color.new(color.red,92) : na)) : na
+
+color bg_hw_extended_hours = (displayMode == "Hyperwave Only" and show_cvd_mode and isExtendedHours_hw_flag) ? color.new(color.purple, 97) : na
+
+// Combined mode backgrounds - ONLY JMA Cross
+color bg_combined_jma_cross = (displayMode == "Combined" and show_jma_cross and jma_cross_condition) ? color.new(color.white, 93) : na
+
+// Apply all backgrounds globally
+bgcolor(bg_gann_zones, title="GANN Zones")
+bgcolor(bg_wae_regular_jma, title="WAE Regular JMA")
+bgcolor(bg_wae_extended_hours, title="WAE Extended Hours")
+bgcolor(bg_wae_combined_entry, title="WAE Combined Entry")
+bgcolor(bg_wae_combined_exit, title="WAE Combined Exit")
+bgcolor(bg_hw_jma_cross, title="HW JMA Cross")
+bgcolor(bg_hw_aroon_regime, title="HW Aroon Regime")
+bgcolor(bg_hw_extended_hours, title="HW Extended Hours")
+bgcolor(bg_combined_jma_cross, title="Combined JMA Cross BG")
+
+//════════════════════════════════════════════════════════════════════════════════
+// LABELS
+//════════════════════════════════════════════════════════════════════════════════
+
+// Hyperwave info label (positioned at top of oscillator pane) - hide in Combined mode
+var label info_hw = na
+if barstate.islast and show_hw_plots and show_momentum and displayMode != "Combined"
+    if not na(info_hw)
+        label.delete(info_hw)
+    
+    regime_txt = hw_regime==1 ? "UP" : hw_regime==-1 ? "DN" : "RNG"
+    aroon_regime_txt = final_aroon_regime==1 ? "STRONG" : final_aroon_regime==-1 ? "WEAK" : "NEUT"
+    confirmation = (hw_regime == final_aroon_regime and hw_regime != 0) ? " ✓" : ""
+    cvd_mode = useRegularJMA_hw ? "CVD: REG" : "CVD: ACTIVE"
+    cycle_txt = useAdaptiveCycle_hw ? "\nCycle: " + str.tostring(dominantCycle_hw) : ""
+    cyclic_aroon_txt = useCyclicOnAroon ? "\nCyc-Aroon: ON" : ""
+    
+    mtf_txt = useMTF ? "\nMTF(" + mtfTimeframe + "): " + 
+         (mtf_aroon_regime==1 ? "STRONG" : mtf_aroon_regime==-1 ? "WEAK" : "NEUT") +
+         (mtf_divergence ? " ⚠" : "") : ""
+    
+    // Get the max value in the pane for label positioning
+    max_val = show_wae_plots ? math.max(ta.highest(trendUp, 20), ta.highest(e1, 20)) : th_up * 2
+    
+    info_hw := label.new(bar_index, max_val, 
+      "HW: "+str.tostring(hw_adjusted,"#.###")+"\n"+
+      "Reg: "+regime_txt+confirmation+"\n"+
+      "AroonW: "+str.tostring(final_aroonWeight,"#.###")+"\n"+
+      "AroonReg: "+aroon_regime_txt+"\n"+
+      "AroonDisp: "+str.tostring(final_aroonDisplay,"#.###")+"\n"+
+      "AroonOsc: "+str.tostring(aroon_osc_raw_hw,"#.##")+mtf_txt+"\n"+
+      cvd_mode+cycle_txt+cyclic_aroon_txt,
+      xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, 
+      color=color.new(color.black,50), textcolor=color.white, size=size.small)
+
+//════════════════════════════════════════════════════════════════════════════════
+// ALERTS
+//════════════════════════════════════════════════════════════════════════════════
+
+// WAE/GANN Alerts
+alertcondition(combinedEntrySignal, title="🟢 Combined Entry Signal", message="WAE Uptrend > Dead Zone + GANN Buy Zone")
+alertcondition(combinedExitSignal, title="🔴 Combined Exit Signal", message="WAE Downtrend > Dead Zone + GANN Sell Zone")
+
+alertcondition(signalBuy, title="GANN Buy Signal", message="GANN BUY signal")
+alertcondition(signalSell, title="GANN Sell Signal", message="GANN SELL signal")
+alertcondition(zeroCrossUp, title="GANN Angle Zero Cross Up", message="Angle crossed above zero")
+alertcondition(zeroCrossDown, title="GANN Angle Zero Cross Down", message="Angle crossed below zero")
+
+// Hyperwave Alerts
+alertcondition(hw_regime==1 and final_aroon_regime==1, "Hyperwave Strong Up", "Hyperwave: STRONG UP (confirmed by Aroon)")
+alertcondition(hw_regime==1 and final_aroon_regime!=1, "Hyperwave Weak Up", "Hyperwave: WEAK UP (not confirmed by Aroon)")
+alertcondition(hw_regime==-1 and final_aroon_regime==-1, "Hyperwave Strong Down", "Hyperwave: STRONG DOWN (confirmed by Aroon)")
+alertcondition(hw_regime==-1 and final_aroon_regime!=-1, "Hyperwave Weak Down", "Hyperwave: WEAK DOWN (not confirmed by Aroon)")
+alertcondition(hw_regime==1, "Hyperwave Up Regime", "Hyperwave: UP regime")
+alertcondition(hw_regime==-1, "Hyperwave Down Regime", "Hyperwave: DOWN regime")
+alertcondition(mtf_divergence and mtf_aroon_regime==1, "MTF Early Bullish", "MTF Aroon: Early bullish signal (divergence)")
+alertcondition(mtf_divergence and mtf_aroon_regime==-1, "MTF Early Bearish", "MTF Aroon: Early bearish signal (divergence)")
+
+// COMBINED MODE SPECIFIC ALERTS
+alertcondition(show_combined_colors and is_first_entry_in_cross, title="⚪ WHITE COLUMN - First Entry in JMA Cross", 
+     message="WHITE COLUMN: First Combined Entry signal in new JMA Cross zone (Trade started with momentum & volume)")
+
+alertcondition(show_combined_colors and not jma_cross_condition and hw_color_red and combinedExitSignal, 
+     title="🟣 PINK COLUMN - Exit Signal", 
+     message="PINK COLUMN: No JMA Cross + Hyperwave Red + Combined Exit")
+
+//════════════════════════════════════════════════════════════════════════════════
+// HIDDEN OUTPUTS
+//════════════════════════════════════════════════════════════════════════════════
+
+plot(signalBuy ? 1 : 0, "GANN Buy Signal", display=display.none)
+plot(signalSell ? 1 : 0, "GANN Sell Signal", display=display.none)
+plot(math.abs(angleSmoothed), "GANN Angle Magnitude", display=display.none)
+
+plot(combinedEntrySignal ? 1 : 0, "Combined Entry Signal", display=display.none)
+plot(combinedExitSignal ? 1 : 0, "Combined Exit Signal", display=display.none)
+
+plot(hw_regime, "Hyperwave Regime", display=display.none)
+plot(final_aroon_regime, "Aroon Regime", display=display.none)

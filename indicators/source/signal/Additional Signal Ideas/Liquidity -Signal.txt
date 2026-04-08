@@ -1,0 +1,770 @@
+//@version=5
+indicator("Liquidity Reversal Engine v3 — JMA/CVD/Structure", overlay=false, max_bars_back=5000)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpJMA = "JMA — Trend Health (Background)"
+jmaLen        = input.int(16,  "JMA Length",           minval=2,          group=grpJMA)
+jmaPhase      = input.int(30,  "JMA Phase",            minval=-100, maxval=100, group=grpJMA)
+jmaPower      = input.int(2,   "JMA Power",            minval=1,   maxval=10,   group=grpJMA)
+accelLen      = input.int(3,   "Acceleration Smoothing (bars)", minval=1,   group=grpJMA)
+slopeLen      = input.int(2,   "Slope Lookback (bars)",         minval=1,   group=grpJMA)
+// Named colors per JMA state — opacity included in color picker
+colJmaStrongUp  = input.color(color.new(color.green,  80), "Strong Up   (Slope+ / Accel+)", group=grpJMA)
+colJmaWeakUp    = input.color(color.new(color.yellow, 80), "Weak Up     (Slope+ / Accel−)", group=grpJMA)
+colJmaSlowingDn = input.color(color.new(color.blue,   80), "Slowing Dn  (Slope− / Accel+)", group=grpJMA)
+colJmaDown      = input.color(color.new(color.red,    80), "Down        (Slope− / Accel−)", group=grpJMA)
+
+grpDiv = "JMA Divergence — Arrows"
+divLookback    = input.int(10, "Divergence Pivot Lookback", minval=3, group=grpDiv)
+divConfirm     = input.int(3,  "Divergence Confirm Bars",   minval=1, group=grpDiv)
+colDivBull     = input.color(color.new(color.green, 0), "Bullish Divergence Arrow ↑", group=grpDiv)
+colDivBear     = input.color(color.new(color.red,   0), "Bearish Divergence Arrow ↓", group=grpDiv)
+
+grpHTF = "HTF — Market State Histogram"
+htfTF          = input.timeframe("5",  "HTF Timeframe",               group=grpHTF)
+htfEffLen      = input.int(12,  "HTF Efficiency Lookback",   minval=3, group=grpHTF)
+htfPathLen     = input.int(12,  "HTF Path Volatility Length",minval=3, group=grpHTF)
+htfVolLen      = input.int(12,  "HTF Volume Norm Length",    minval=3, group=grpHTF)
+htfVerSmooth   = input.int(3,   "HTF VER/VWER Smoothing",   minval=1, group=grpHTF)
+htfTrendTh     = input.float(0.55, "HTF Trend Threshold",   step=0.01, group=grpHTF)
+htfReversalTh  = input.float(0.25, "HTF Reversal Threshold",step=0.01, group=grpHTF)
+showHistogram  = input.bool(true,  "Show Market State Histogram",      group=grpHTF)
+// Named colors per HTF state
+colHtfTrending    = input.color(color.new(color.green,  30), "Trending    (Both VER+VWER > Trend Th)",    group=grpHTF)
+colHtfShifting    = input.color(color.new(color.yellow, 30), "Shifting    (VER or VWER falling)",         group=grpHTF)
+colHtfRanging     = input.color(color.new(color.red,    30), "Ranging     (Either < Reversal Th)",        group=grpHTF)
+colHtfNeutral     = input.color(color.new(color.gray,   50), "Neutral     (Transitional)",                group=grpHTF)
+
+grpCVD = "CVD — Triangles"
+ltfTimeframe   = input.timeframe("30S", "LTF Timeframe (30S default / 10S available)", group=grpCVD)
+cvdLen         = input.int(20, "CVD Windowed Length",  minval=5, group=grpCVD)
+cvdSmooth      = input.int(3,  "CVD EMA Smoothing",    minval=1, group=grpCVD)
+colCvdBull     = input.color(color.new(color.green, 0), "Bullish Flip Triangle ▲", group=grpCVD)
+colCvdBear     = input.color(color.new(color.red,   0), "Bearish Flip Triangle ▼", group=grpCVD)
+
+grpStruct = "Structure — Diamonds"
+sweepLookback  = input.int(20, "Liquidity Sweep Lookback",  minval=5, group=grpStruct)
+rejectionLen   = input.int(10, "Range Rejection Length",    minval=3, group=grpStruct)
+microBosLen    = input.int(5,  "Micro BOS Lookback",        minval=2, group=grpStruct)
+weakCloseTh    = input.float(0.30, "Weak Close Threshold",  step=0.05, group=grpStruct)
+colSweepBull   = input.color(color.new(color.green,  0), "Sweep Low      ◆ (Large Bull)",  group=grpStruct)
+colRejectBull  = input.color(color.new(color.green,  0), "Reject Low     ◆ (Medium Bull)", group=grpStruct)
+colMicoBull    = input.color(color.new(color.lime,  30), "Micro BOS Long ◆ (Small Bull)",  group=grpStruct)
+colSweepBear   = input.color(color.new(color.red,    0), "Sweep High     ◆ (Large Bear)",  group=grpStruct)
+colRejectBear  = input.color(color.new(color.red,    0), "Reject High    ◆ (Medium Bear)", group=grpStruct)
+colMicoBear    = input.color(color.new(color.orange,30), "Micro BOS Short◆ (Small Bear)",  group=grpStruct)
+
+grpWAE = "WAE — Volatility Context"
+sensitivity    = input.int(7,  "WAE Sensitivity",  group=grpWAE)
+volJmaLen      = input.int(5,  "Vol JMA Length",   minval=1, group=grpWAE)
+volJmaPhase    = input.int(50, "Vol JMA Phase",    minval=-100, maxval=100, group=grpWAE)
+volJmaPower    = input.int(2,  "Vol JMA Power",    minval=1, group=grpWAE)
+volPeriod      = input.int(7,  "Volatility Period",minval=1, group=grpWAE)
+volType        = input.string("ATR", "Volatility Type", options=["ATR","Standard Deviation","True Range"], group=grpWAE)
+vwjmaLen       = input.int(16, "VW-JMA Length",    minval=1, group=grpWAE)
+vwjmaPhase     = input.int(50, "VW-JMA Phase",     minval=-100, maxval=100, group=grpWAE)
+vwjmaPower     = input.int(2,  "VW-JMA Power",     minval=1, group=grpWAE)
+minVolTh       = input.float(50.0, "Min Volume % of Avg", minval=0.1, maxval=100, group=grpWAE)
+useExtHours    = input.bool(true, "Detect Extended Hours", group=grpWAE)
+vwjmaSmooth    = input.int(9,  "VW-JMA Smoothing", minval=1, maxval=10, group=grpWAE)
+
+grpVER = "VER + VWER — Efficiency (Data Window)"
+verEffLen      = input.int(20,   "Efficiency Lookback",   minval=5,  group=grpVER)
+verPathLen     = input.int(20,   "Path Volatility Length",minval=5,  group=grpVER)
+verVolLen      = input.int(20,   "Volume Norm Length",    minval=5,  group=grpVER)
+verSmooth      = input.int(3,    "VER/VWER Smoothing",    minval=1,  group=grpVER)
+
+grpViz = "Display"
+showBg         = input.bool(true,  "Show JMA Background",      group=grpViz)
+showTriangles  = input.bool(true,  "Show CVD Triangles",       group=grpViz)
+showDiamonds   = input.bool(true,  "Show Structure Diamonds",  group=grpViz)
+showArrows     = input.bool(true,  "Show Divergence Arrows",   group=grpViz)
+showTable      = input.bool(true,  "Show Diagnostic Table",    group=grpViz)
+showScoreLine  = input.bool(true,  "Show Score Line",          group=grpViz)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HELPERS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_sum_abs_change(_src, _len) =>
+    float s = 0.0
+    for i = 0 to _len - 1
+        s += math.abs(_src[i] - _src[i + 1])
+    s
+
+f_mad(_src, _len) =>
+    ta.sma(math.abs(_src - ta.sma(_src, _len)), _len)
+
+f_zscore(_src, _len) =>
+    m = ta.sma(_src, _len)
+    s = ta.stdev(_src, _len)
+    s == 0.0 ? 0.0 : (_src - m) / s
+
+jma_func(_src, _length, _phase, _power) =>
+    phaseRatio = _phase < -100 ? 0.5 : _phase > 100 ? 2.5 : _phase / 100 + 1.5
+    beta  = 0.45 * (_length - 1) / (0.45 * (_length - 1) + 2)
+    alpha = math.pow(beta, _power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jv = na
+    e0 := (1 - alpha) * _src + alpha * nz(e0[1], _src)
+    e1 := (_src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jv[1], _src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jv  := e2 + nz(jv[1], _src)
+    jv
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 0 — JMA HEALTH (Background Color Driver)
+//
+//  jmaSlope    = first derivative  (is the JMA rising or falling?)
+//  jmaAccel    = second derivative (is the slope gaining or losing momentum?)
+//
+//  State matrix:
+//    Slope+ / Accel+  →  GREEN   (trend strengthening)
+//    Slope+ / Accel-  →  YELLOW  (trend weakening, still up)
+//    Slope- / Accel-  →  RED     (trend falling and accelerating down)
+//    Slope- / Accel+  →  BLUE    (downtrend slowing, potential base)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+jma         = jma_func(close, jmaLen, jmaPhase, jmaPower)
+jmaSlope    = jma - jma[slopeLen]
+jmaAccelRaw = jmaSlope - jmaSlope[1]
+jmaAccel    = ta.ema(jmaAccelRaw, accelLen)   // Smoothed to remove single-bar noise
+
+slopePos    = jmaSlope > 0
+slopeNeg    = jmaSlope < 0
+accelPos    = jmaAccel > 0
+accelNeg    = jmaAccel < 0
+
+// Four states
+jmaGreen  = slopePos and accelPos    // Strengthening uptrend
+jmaYellow = slopePos and accelNeg    // Weakening uptrend
+jmaRed    = slopeNeg and accelNeg    // Accelerating downtrend
+jmaBlue   = slopeNeg and accelPos    // Slowing downtrend
+
+jmaStateStr = jmaGreen ? "STRONG UP" : jmaYellow ? "WEAK UP" : jmaBlue ? "SLOWING DN" : "DOWN"
+
+bgCol = showBg ? (jmaGreen  ? colJmaStrongUp  : jmaYellow ? colJmaWeakUp    : jmaBlue   ? colJmaSlowingDn : colJmaDown) : na
+
+bgcolor(bgCol, title="JMA Health Background")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 0b — VER + VWER (computed early — needed for divergence gate)
+//
+//  Must run before divergence section so efficiency state is available.
+//  VER  = volatility-weighted efficiency ratio (penalises choppy path)
+//  VWER = volume-weighted efficiency ratio     (penalises low participation)
+//  Spread = VER - VWER  →  positive = chop dominant, negative = volume deficit
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ver_net     = math.abs(close - close[verEffLen])
+ver_path    = f_sum_abs_change(close, verEffLen)
+ver_path    := ver_path == 0 ? 1.0 : ver_path
+ver_pathVol = f_mad(close, verPathLen)
+ver_pathVol := ver_pathVol == 0 ? 1.0 : ver_pathVol
+ver_avgVol  = ta.sma(volume, verVolLen)
+ver_normVol = ver_avgVol != 0 ? volume / ver_avgVol : 1.0
+
+ver  = ta.ema(ver_net / (ver_path * ver_pathVol), verSmooth)
+vwer = ta.ema(ver_net / (ver_path * ver_normVol), verSmooth)
+
+// Spread analytics (used in score modifier — Improvement 4)
+verSpread      = ver - vwer                        // + = chop dominant, − = volume deficit
+verSpreadSlope = verSpread - verSpread[3]          // 3-bar slope for stability vs noise
+verSpreadChopDom  = verSpread > 0                  // Chop penalty > volume penalty
+verSpreadVolDom   = verSpread < 0                  // Volume penalty > chop penalty
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 1 — JMA PRICE DIVERGENCE (Arrows)
+//
+//  Divergence = price makes a new swing extreme but JMA does NOT confirm it.
+//  This fires *before* structure breaks — the JMA is already disagreeing
+//  with what price is doing.
+//
+//  Bearish divergence: price makes higher high, JMA makes lower high
+//    → JMA is not confirming the new high → downward arrow
+//
+//  Bullish divergence: price makes lower low, JMA makes higher low
+//    → JMA is not confirming the new low → upward arrow
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Price pivots (used for divergence comparison only — not for structure)
+pricePH = ta.pivothigh(high, divLookback, divLookback)
+pricePL = ta.pivotlow(low,  divLookback, divLookback)
+
+// JMA value at the same pivot bars
+jmaPH = ta.pivothigh(jma, divLookback, divLookback)
+jmaPL = ta.pivotlow(jma,  divLookback, divLookback)
+
+// Track last two pivot values for both price and JMA
+var float lastPriceHigh = na
+var float prevPriceHigh = na
+var float lastJMAHigh   = na
+var float prevJMAHigh   = na
+
+var float lastPriceLow  = na
+var float prevPriceLow  = na
+var float lastJMALow    = na
+var float prevJMALow    = na
+
+if not na(pricePH)
+    prevPriceHigh := lastPriceHigh
+    lastPriceHigh := pricePH
+if not na(jmaPH)
+    prevJMAHigh := lastJMAHigh
+    lastJMAHigh := jmaPH
+
+if not na(pricePL)
+    prevPriceLow := lastPriceLow
+    lastPriceLow := pricePL
+if not na(jmaPL)
+    prevJMALow := lastJMALow
+    lastJMALow := jmaPL
+
+// Bearish divergence: price HH + JMA LH
+bearishDiv = not na(lastPriceHigh) and not na(prevPriceHigh) and
+             not na(lastJMAHigh)   and not na(prevJMAHigh)   and
+             (lastPriceHigh > prevPriceHigh) and   // Price made higher high
+             (lastJMAHigh   < prevJMAHigh)           // JMA made lower high
+
+// Bullish divergence: price LL + JMA HL
+bullishDiv = not na(lastPriceLow) and not na(prevPriceLow) and
+             not na(lastJMALow)   and not na(prevJMALow)   and
+             (lastPriceLow < prevPriceLow) and   // Price made lower low
+             (lastJMALow   > prevJMALow)          // JMA made higher low
+
+// Improvement 1: Efficiency gate for divergence
+// Divergence is signal only when efficiency is weakening or already weak.
+// When VER > 0.55 and VWER > 0.55 (strong trend), divergence = noise.
+efficiencyWeakForDiv = ver < ver[1] or vwer < 0.55
+
+// Divergence fires at the pivot confirmation bar — gated by efficiency
+bearishDivSignal = bearishDiv and not na(pricePH) and efficiencyWeakForDiv
+bullishDivSignal = bullishDiv and not na(pricePL) and efficiencyWeakForDiv
+
+plotshape(showArrows ? bearishDivSignal : na, "Bearish JMA Divergence",
+          shape.arrowdown, location.abovebar,
+          colDivBear, size=size.small)
+
+plotshape(showArrows ? bullishDivSignal : na, "Bullish JMA Divergence",
+          shape.arrowup, location.belowbar,
+          colDivBull, size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 2 — WAE (Volatility Context — preserved, internal use only)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DEAD_ZONE = ta.rma(ta.tr(true), 100) * 3.7
+
+rawVol = switch volType
+    "ATR"                => ta.atr(volPeriod)
+    "Standard Deviation" => ta.stdev(close, volPeriod)
+    "True Range"         => ta.tr
+    =>                      ta.atr(volPeriod)
+
+rawVol := na(rawVol) or rawVol == 0 ? 1 : rawVol
+volWeight   = rawVol / ta.ema(rawVol, volPeriod)
+weightedSrc = close * volWeight
+
+vPhaseR = volJmaPhase < -100 ? 0.5 : volJmaPhase > 100 ? 2.5 : volJmaPhase / 100 + 1.5
+vBeta   = 0.45 * (volJmaLen - 1) / (0.45 * (volJmaLen - 1) + 2)
+vAlpha  = math.pow(vBeta, volJmaPower)
+
+var float ve0vw = 0.0, ve0vw := (1-vAlpha)*weightedSrc + vAlpha*nz(ve0vw[1],weightedSrc)
+var float ve1vw = 0.0, ve1vw := (weightedSrc-ve0vw)*(1-vBeta) + vBeta*nz(ve1vw[1],0)
+var float ve2vw = 0.0
+var float vjvw  = 0.0
+ve2vw := (ve0vw + vPhaseR*ve1vw - vjvw)*math.pow(1-vAlpha,2) + math.pow(vAlpha,2)*nz(ve2vw[1],0)
+vjvw  := ve2vw + vjvw
+
+var float ve0v = 0.0,  ve0v  := (1-vAlpha)*volWeight + vAlpha*nz(ve0v[1],volWeight)
+var float ve1v = 0.0,  ve1v  := (volWeight-ve0v)*(1-vBeta) + vBeta*nz(ve1v[1],0)
+var float ve2v = 0.0
+var float vjv  = 0.0
+ve2v := (ve0v + vPhaseR*ve1v - vjv)*math.pow(1-vAlpha,2) + math.pow(vAlpha,2)*nz(ve2v[1],0)
+vjv  := ve2v + vjv
+
+volJMA = vjv != 0 ? vjvw / vjv : close
+
+isExtHours = useExtHours ? na(time(timeframe.period, "0930-1600", "America/New_York")) : false
+avgVol     = ta.sma(volume, vwjmaLen * 2)
+isLowVol   = volume < avgVol * (minVolTh / 100.0) or isExtHours
+isErratic  = ta.stdev(volume, vwjmaLen) > 0 and
+             math.abs(volume - volume[1]) > ta.stdev(volume, vwjmaLen) * 3
+
+useRegJMA  = isLowVol or isErratic
+regJMA     = jma_func(close, vwjmaLen, vwjmaPhase, vwjmaPower)
+
+vwPhaseR = vwjmaPhase<-100?0.5:vwjmaPhase>100?2.5:vwjmaPhase/100+1.5
+vwBeta   = 0.45*(vwjmaLen-1)/(0.45*(vwjmaLen-1)+2)
+vwAlpha  = math.pow(vwBeta, vwjmaPower)
+
+clampVol  = math.max(avgVol*0.1, math.min(volume, avgVol*5))
+normVol   = clampVol > 0 ? clampVol : 1.0
+vwP       = close * normVol
+
+var float vw0vw=0.0, vw0vw:=(1-vwAlpha)*vwP+vwAlpha*nz(vw0vw[1],vwP)
+var float vw1vw=0.0, vw1vw:=(vwP-vw0vw)*(1-vwBeta)+vwBeta*nz(vw1vw[1],0)
+var float vw2vw=0.0
+var float vwNumer=0.0
+vw2vw   := (vw0vw+vwPhaseR*vw1vw-vwNumer)*math.pow(1-vwAlpha,2)+math.pow(vwAlpha,2)*nz(vw2vw[1],0)
+vwNumer := vw2vw+vwNumer
+
+var float vw0v=0.0,  vw0v :=(1-vwAlpha)*normVol+vwAlpha*nz(vw0v[1],normVol)
+var float vw1v=0.0,  vw1v :=(normVol-vw0v)*(1-vwBeta)+vwBeta*nz(vw1v[1],0)
+var float vw2v=0.0
+var float vwDenom=0.0
+vw2v    := (vw0v+vwPhaseR*vw1v-vwDenom)*math.pow(1-vwAlpha,2)+math.pow(vwAlpha,2)*nz(vw2v[1],0)
+vwDenom := vw2v+vwDenom
+
+vwJMA_raw  = vwDenom != 0 ? vwNumer / vwDenom : close
+isDeviated = math.abs(vwJMA_raw - close) / close > 0.05
+vwJMA_tmp  = (useRegJMA or isDeviated) ? regJMA : vwJMA_raw
+
+sAlpha = 2.0 / (vwjmaSmooth + 1)
+var float vwJMA = na
+vwJMA := na(vwJMA) ? vwJMA_tmp : sAlpha * vwJMA_tmp + (1 - sAlpha) * vwJMA
+if useRegJMA
+    eA = 2.0 / (vwjmaSmooth * 2 + 1)
+    vwJMA := eA * vwJMA_tmp + (1 - eA) * vwJMA
+
+macdVal  = volJMA - vwJMA
+t1       = (macdVal - macdVal[1]) * sensitivity
+waeExpansion   = math.abs(t1) > DEAD_ZONE
+waeCompression = math.abs(t1) < DEAD_ZONE
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 3 — LTF CVD (Triangles on Zero Cross)
+//
+//  Aggregates 30s bar deltas into each 1-min bar.
+//  Windowed rolling sum prevents cumulative drift.
+//  Triangle fires on zero cross only — not on every rise/fall.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ltf_h = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, high)
+ltf_l = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, low)
+ltf_c = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, close)
+ltf_v = request.security_lower_tf(syminfo.tickerid, ltfTimeframe, volume)
+
+float deltaAgg = 0.0
+if array.size(ltf_h) > 0
+    for i = 0 to array.size(ltf_h) - 1
+        h = array.get(ltf_h, i)
+        l = array.get(ltf_l, i)
+        c = array.get(ltf_c, i)
+        v = array.get(ltf_v, i)
+        deltaAgg += (h != l) ? v * (2 * c - h - l) / (h - l) : 0.0
+
+cvd = ta.ema(math.sum(deltaAgg, cvdLen), cvdSmooth)
+
+cvdBullishFlip = ta.crossover(cvd, 0)    // CVD crossed above zero
+cvdBearishFlip = ta.crossunder(cvd, 0)   // CVD crossed below zero
+
+// Improvement 2: CVD compression — delta flat while price still moves
+// This is the absorptive signal (smart money distributing/accumulating quietly)
+// More meaningful than a raw zero-cross because it requires price/delta divergence
+atr14           = ta.atr(14)
+cvdAvgMove      = ta.sma(math.abs(cvd - cvd[1]), cvdLen)
+cvdFlat         = math.abs(cvd - cvd[1]) < (cvdAvgMove * 0.25)   // Delta barely moving
+priceActive     = math.abs(close - close[1]) > (atr14 * 0.15)    // But price is moving
+cvdCompression  = cvdFlat and priceActive                          // Absorption signal
+
+plotshape(showTriangles ? cvdBullishFlip : na, "CVD Bullish Flip",
+          shape.triangleup, location.belowbar,
+          colCvdBull, size=size.normal)
+
+plotshape(showTriangles ? cvdBearishFlip : na, "CVD Bearish Flip",
+          shape.triangledown, location.abovebar,
+          colCvdBear, size=size.normal)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 4 — STRUCTURAL BREAKS (Diamonds, Size Scaled)
+//
+//  Priority hierarchy — highest level wins, no double-counting:
+//    Level 3 → Liquidity Sweep  → size.normal  (engineered stop run)
+//    Level 2 → Range Rejection  → size.small   (acceptance failure)
+//    Level 1 → Micro BOS        → size.tiny    (early structural warning)
+//
+//  Bullish signals fire below bar (green diamonds)
+//  Bearish signals fire above bar (red diamonds)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Rolling extremes (prior period, no lookahead)
+rollHigh = ta.highest(high, sweepLookback)[1]
+rollLow  = ta.lowest(low,  sweepLookback)[1]
+
+// Level 3: Liquidity sweep
+sweepLow  = low < rollLow  and close > rollLow    // Swept low, closed back inside
+sweepHigh = high > rollHigh and close < rollHigh   // Swept high, closed back inside
+
+// Level 2: Range rejection
+rngHigh = ta.highest(high, rejectionLen)
+rngLow  = ta.lowest(low,  rejectionLen)
+rngMid  = (rngHigh + rngLow) / 2
+
+rejectLow  = low  <= rngLow  and close > rngMid   // Tested low, closed above mid
+rejectHigh = high >= rngHigh and close < rngMid   // Tested high, closed below mid
+
+// Level 1: Micro BOS (weak close at extreme in trend direction)
+mbHigh  = ta.highest(high, microBosLen)
+mbLow   = ta.lowest(low,  microBosLen)
+barRng  = high - low
+
+weakLow  = barRng > 0 and (close - low)  / barRng < weakCloseTh   // Close near low
+weakHigh = barRng > 0 and (high - close) / barRng < weakCloseTh   // Close near high
+
+microBosLong  = slopeNeg and low < mbLow[1]  and weakLow    // New low in downtrend + weak close
+microBosShort = slopePos and high > mbHigh[1] and weakHigh  // New high in uptrend + weak close
+
+// Hierarchy: highest level wins
+int structBullLevel = sweepLow ? 3 : rejectLow ? 2 : microBosLong ? 1 : 0
+int structBearLevel = sweepHigh ? 3 : rejectHigh ? 2 : microBosShort ? 1 : 0
+
+// Improvement 5: Price-based micro BOS decay
+// If micro BOS fires but price moves > 0.5 ATR away without a level 2/3 confirming,
+// the micro signal is invalidated — stale micro pressure removed from score.
+var int   microBullBar   = na
+var float microBullClose = na
+var int   microBearBar   = na
+var float microBearClose = na
+
+// Record bar/close when micro fires (level 1 only)
+if structBullLevel == 1
+    microBullBar   := bar_index
+    microBullClose := close
+if structBullLevel >= 2   // Level 2/3 confirmed — reset micro tracker
+    microBullBar   := na
+    microBullClose := na
+
+if structBearLevel == 1
+    microBearBar   := bar_index
+    microBearClose := close
+if structBearLevel >= 2
+    microBearBar   := na
+    microBearClose := na
+
+// Decay condition: micro fired, no level 2/3 since, price moved > 0.5 ATR
+microBullDecayed = not na(microBullBar) and structBullLevel < 2 and
+                   math.abs(close - microBullClose) > atr14 * 0.5
+
+microBearDecayed = not na(microBearBar) and structBearLevel < 2 and
+                   math.abs(close - microBearClose) > atr14 * 0.5
+
+// Effective levels after decay applied
+effectiveBullLevel = microBullDecayed ? 0 : structBullLevel
+effectiveBearLevel = microBearDecayed ? 0 : structBearLevel
+
+// Bullish diamonds (below bar) — one plotshape per level, gated by level match
+plotshape(showDiamonds ? (structBullLevel == 3) : na, "Sweep Low",
+          shape.diamond, location.belowbar, colSweepBull, size=size.normal)
+
+plotshape(showDiamonds ? (structBullLevel == 2) : na, "Reject Low",
+          shape.diamond, location.belowbar, colRejectBull, size=size.small)
+
+plotshape(showDiamonds ? (structBullLevel == 1) : na, "Micro BOS Long",
+          shape.diamond, location.belowbar, colMicoBull, size=size.tiny)
+
+// Bearish diamonds (above bar) — one plotshape per level
+plotshape(showDiamonds ? (structBearLevel == 3) : na, "Sweep High",
+          shape.diamond, location.abovebar, colSweepBear, size=size.normal)
+
+plotshape(showDiamonds ? (structBearLevel == 2) : na, "Reject High",
+          shape.diamond, location.abovebar, colRejectBear, size=size.small)
+
+plotshape(showDiamonds ? (structBearLevel == 1) : na, "Micro BOS Short",
+          shape.diamond, location.abovebar, colMicoBear, size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 5 — VER + VWER (computed in Layer 0b above — see score section)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 6 — HTF VER + VWER (Market State Histogram)
+//
+//  Runs VER and VWER on 5-minute bars to classify the broader session regime.
+//  VER (volatility-weighted ER) — penalises choppy path
+//  VWER (volume-weighted ER)    — penalises low participation
+//
+//  Four histogram states (color changes on regime shift):
+//    GREEN  — Both > htfTrendTh      → Trending session, momentum works
+//    YELLOW — VER falling + VWER OK  → Deteriorating, regime shifting
+//    RED    — Either < htfReversalTh → Ranging/exhausted, fade extremes
+//    GRAY   — Neutral / transitional
+//
+//  Bar height = htfVER value (0 to ~1+)
+//  The histogram sits in the same pane and auto-scales with the score line.
+//  Both series share the 0-1 range so they coexist cleanly.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Request HTF values — all calculations run natively on the HTF bars
+[htfVER, htfVWER] = request.security(syminfo.tickerid, htfTF,
+     [ta.ema(
+         math.abs(close - close[htfEffLen]) /
+         math.max(
+             (math.sum(math.abs(close - close[1]), htfEffLen)) == 0 ? 1.0 :
+              math.sum(math.abs(close - close[1]), htfEffLen), 1.0) /
+         math.max(ta.sma(math.abs(close - ta.sma(close, htfPathLen)), htfPathLen), 1.0),
+         htfVerSmooth),
+      ta.ema(
+         math.abs(close - close[htfEffLen]) /
+         math.max(
+             (math.sum(math.abs(close - close[1]), htfEffLen)) == 0 ? 1.0 :
+              math.sum(math.abs(close - close[1]), htfEffLen), 1.0) /
+         math.max(ta.sma(volume, htfVolLen) != 0 ? volume / ta.sma(volume, htfVolLen) : 1.0, 0.01),
+         htfVerSmooth)],
+     lookahead=barmerge.lookahead_off)
+
+// HTF State classification
+htfTrending    = htfVER > htfTrendTh   and htfVWER > htfTrendTh
+htfDeteriorate = (htfVER < htfVER[1]   and htfVWER > htfVWER[1]) or
+                 (htfVER < htfVER[1]   and htfVWER < htfVWER[1])
+htfRanging     = htfVER < htfReversalTh or htfVWER < htfReversalTh
+
+// State label for table
+htfStateStr    = htfTrending ? "TRENDING" : htfRanging ? "RANGING" :
+                 htfDeteriorate ? "SHIFTING" : "NEUTRAL"
+
+// Histogram color per state — uses named input colors
+htfHistColor   = htfTrending    ? colHtfTrending  :
+                 htfDeteriorate ? colHtfShifting   :
+                 htfRanging     ? colHtfRanging    :
+                                  colHtfNeutral
+
+// Histogram — VER value as height, color by state
+// Capped at 1.0 to share visual space with score line cleanly
+htfHistVal     = showHistogram ? math.min(htfVER, 1.0) : na
+plot(htfHistVal, "HTF Market State", color=htfHistColor,
+     style=plot.style_histogram, linewidth=4)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SCORE LINE  (v3.1 — All 5 Improvements Active)
+//
+//  Tier 1 — JMA Health          (40%)  Trend strength/direction
+//  Tier 2 — CVD State            (35%)  Order flow (compression weighted > flip)
+//  Tier 3 — Structure            (25%)  Structural events (decayed micro applied)
+//  Modifier A — VER-VWER Spread  (±8%)  Intent imbalance direction
+//  Sub-linear compression applied to final score
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Tier 1: JMA health (unchanged)
+jmaTierScore = jmaGreen ? 1.0 : jmaYellow ? 0.65 : jmaBlue ? 0.35 : 0.0
+
+// Tier 2: CVD — Improvement 2: compression weighted higher than raw flip
+// Compression (absorption) = 0.85 base  — rare, meaningful
+// Position (above/below zero + direction) = 0–1 gradient
+// Flip alone = only 0.50 push (not decisive on its own)
+cvdPosition  = cvd > 0 and cvd > cvd[1] ? 0.80 :   // Rising positive delta
+               cvd > 0                   ? 0.60 :   // Positive but flat
+               cvd < 0 and cvd < cvd[1] ? 0.10 :   // Falling negative delta
+                                          0.30       // Negative but flat
+
+// Compression bonus: pushes score toward 0.85 regardless of flip state
+// Bullish compression (positive CVD compressing) lifts score
+// Bearish compression (negative CVD compressing) holds score down
+cvdCompressionBonus = cvdCompression ? (cvd > 0 ? 0.15 : -0.15) : 0.0
+
+cvdTierScore = math.max(0.0, math.min(1.0, cvdPosition + cvdCompressionBonus))
+
+// Tier 3: Structure — uses effectiveBullLevel/effectiveBearLevel (micro decay applied)
+structTierScore = effectiveBullLevel == 3 ? 1.0 :
+                  effectiveBullLevel == 2 ? 0.75 :
+                  effectiveBullLevel == 1 ? 0.50 :
+                  effectiveBearLevel == 3 ? 0.0 :
+                  effectiveBearLevel == 2 ? 0.25 :
+                  effectiveBearLevel == 1 ? 0.40 :
+                  0.50
+
+// Improvement 4: VER–VWER spread modifier
+// Spread direction AND dominant metric both matter
+// Chop dominant + spreading = distribution pressure → bearish
+// Chop dominant + compressing = chop resolving → mild bullish
+// Volume deficit + worsening = thin market → mild bearish
+// Volume deficit + recovering = participation returning → bullish
+spreadModifier = verSpreadChopDom  and verSpreadSlope > 0 ? -0.08 : verSpreadChopDom  and verSpreadSlope < 0 ?  0.05 : verSpreadVolDom   and verSpreadSlope < 0 ? -0.05 : verSpreadVolDom   and verSpreadSlope > 0 ?  0.08 : 0.0
+
+// Linear weighted sum before sub-linear compression
+rawLinear = (jmaTierScore * 0.40) + (cvdTierScore * 0.35) + (structTierScore * 0.25) + spreadModifier
+
+rawLinear := math.max(0.0, math.min(1.0, rawLinear))
+
+// Improvement 3: Sub-linear compression
+// Symmetric around 0.5 — diminishing returns from additional confirming signals
+// Still reaches 0 and 1 at extremes; compresses toward center for mixed signals
+// math.pow(x, 0.80) curves the distance from 0.5, reducing marginal gains
+finalScore = rawLinear < 0.5 ? 0.5 - math.pow(0.5 - rawLinear, 0.80) : 0.5 + math.pow(rawLinear - 0.5, 0.80)
+
+scoreCol = finalScore > 0.70 ? color.new(color.lime,   0) :
+           finalScore > 0.50 ? color.new(color.yellow, 0) :
+           finalScore > 0.30 ? color.new(color.orange, 0) :
+           color.new(color.red, 0)
+
+plot(showScoreLine ? finalScore : na, "Score", color=scoreCol, linewidth=2)
+hline(0.70, "Strong",  color=color.new(color.green, 50), linestyle=hline.style_dashed)
+hline(0.50, "Neutral", color=color.new(color.gray,  50), linestyle=hline.style_dotted)
+hline(0.30, "Weak",    color=color.new(color.red,   50), linestyle=hline.style_dashed)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DIAGNOSTIC TABLE (v3.1 — 22 rows)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if showTable and barstate.islast
+    var table t = table.new(position.top_right, 3, 22, border_width=1)
+
+    // Header
+    table.cell(t, 0, 0,  "Layer",   bgcolor=color.gray,   text_color=color.white)
+    table.cell(t, 1, 0,  "Signal",  bgcolor=color.gray,   text_color=color.white)
+    table.cell(t, 2, 0,  "State",   bgcolor=color.gray,   text_color=color.white)
+
+    // JMA Health
+    table.cell(t, 0, 1,  "JMA",     bgcolor=color.navy,   text_color=color.white)
+    table.cell(t, 1, 1,  "State",                         text_color=color.white)
+    table.cell(t, 2, 1,  jmaStateStr,
+               text_color=jmaGreen ? color.lime : jmaYellow ? color.yellow :
+                          jmaBlue  ? color.aqua : color.red)
+
+    table.cell(t, 0, 2,  "JMA",     bgcolor=color.navy,   text_color=color.white)
+    table.cell(t, 1, 2,  "Slope",                         text_color=color.white)
+    table.cell(t, 2, 2,  str.tostring(jmaSlope, "#.####"),
+               text_color=slopePos ? color.lime : color.red)
+
+    table.cell(t, 0, 3,  "JMA",     bgcolor=color.navy,   text_color=color.white)
+    table.cell(t, 1, 3,  "Accel",                         text_color=color.white)
+    table.cell(t, 2, 3,  str.tostring(jmaAccel, "#.####"),
+               text_color=accelPos ? color.lime : color.red)
+
+    // Divergence — shows gate status (Improvement 1)
+    table.cell(t, 0, 4,  "JMA",     bgcolor=color.navy,   text_color=color.white)
+    table.cell(t, 1, 4,  "Div (gated)",                   text_color=color.white)
+    table.cell(t, 2, 4,  bearishDivSignal ? "BEAR ↓" :
+                         bullishDivSignal ? "BULL ↑" :
+                         not efficiencyWeakForDiv ? "BLOCKED" : "—",
+               text_color=bearishDivSignal ? color.red :
+                          bullishDivSignal ? color.lime :
+                          not efficiencyWeakForDiv ? color.gray : color.gray)
+
+    // CVD — flip + compression (Improvement 2)
+    table.cell(t, 0, 5,  "CVD",     bgcolor=color.teal,   text_color=color.white)
+    table.cell(t, 1, 5,  "Value",                         text_color=color.white)
+    table.cell(t, 2, 5,  str.tostring(cvd, "#.##"),
+               text_color=cvd > 0 ? color.lime : color.red)
+
+    table.cell(t, 0, 6,  "CVD",     bgcolor=color.teal,   text_color=color.white)
+    table.cell(t, 1, 6,  "Flip",                          text_color=color.white)
+    table.cell(t, 2, 6,  cvdBullishFlip ? "▲ BULL" : cvdBearishFlip ? "▼ BEAR" : "—",
+               text_color=cvdBullishFlip ? color.lime : cvdBearishFlip ? color.red : color.gray)
+
+    table.cell(t, 0, 7,  "CVD",     bgcolor=color.teal,   text_color=color.white)
+    table.cell(t, 1, 7,  "Compress",                      text_color=color.white)
+    table.cell(t, 2, 7,  cvdCompression ? (cvd > 0 ? "ABSORB+" : "ABSORB−") : "—",
+               text_color=cvdCompression ? (cvd > 0 ? color.lime : color.red) : color.gray)
+
+    // Structure — raw and effective (Improvement 5)
+    table.cell(t, 0, 8,  "STRUCT",  bgcolor=color.maroon, text_color=color.white)
+    table.cell(t, 1, 8,  "Bull Raw/Eff",                  text_color=color.white)
+    table.cell(t, 2, 8,  (structBullLevel == 3 ? "SWEEP" : structBullLevel == 2 ? "REJECT" :
+                           structBullLevel == 1 ? "MICRO" : "—") + " / " +
+                         (effectiveBullLevel == 3 ? "SWEEP" : effectiveBullLevel == 2 ? "REJECT" :
+                          effectiveBullLevel == 1 ? "MICRO" : "—"),
+               text_color=effectiveBullLevel > 0 ? color.lime :
+                          microBullDecayed ? color.orange : color.gray)
+
+    table.cell(t, 0, 9,  "STRUCT",  bgcolor=color.maroon, text_color=color.white)
+    table.cell(t, 1, 9,  "Bear Raw/Eff",                  text_color=color.white)
+    table.cell(t, 2, 9,  (structBearLevel == 3 ? "SWEEP" : structBearLevel == 2 ? "REJECT" :
+                           structBearLevel == 1 ? "MICRO" : "—") + " / " +
+                         (effectiveBearLevel == 3 ? "SWEEP" : effectiveBearLevel == 2 ? "REJECT" :
+                          effectiveBearLevel == 1 ? "MICRO" : "—"),
+               text_color=effectiveBearLevel > 0 ? color.red :
+                          microBearDecayed ? color.orange : color.gray)
+
+    table.cell(t, 0, 10, "STRUCT",  bgcolor=color.maroon, text_color=color.white)
+    table.cell(t, 1, 10, "Micro Decay",                   text_color=color.white)
+    table.cell(t, 2, 10, microBullDecayed ? "BULL DECAYED" :
+                         microBearDecayed ? "BEAR DECAYED" : "—",
+               text_color=microBullDecayed or microBearDecayed ? color.orange : color.gray)
+
+    // VER/VWER + Spread (Improvement 4)
+    table.cell(t, 0, 11, "VER 1m",  bgcolor=color.orange, text_color=color.white)
+    table.cell(t, 1, 11, "VER/VWER",                      text_color=color.white)
+    table.cell(t, 2, 11, str.tostring(ver, "#.##") + " / " + str.tostring(vwer, "#.##"),
+               text_color=ver > 0.55 and vwer > 0.55 ? color.lime :
+                          ver < 0.25 or  vwer < 0.25 ? color.red : color.yellow)
+
+    table.cell(t, 0, 12, "SPREAD",  bgcolor=color.orange, text_color=color.white)
+    table.cell(t, 1, 12, "State",                         text_color=color.white)
+    table.cell(t, 2, 12, verSpreadChopDom and verSpreadSlope > 0 ? "CHOP↑ −0.08" :
+                         verSpreadChopDom and verSpreadSlope < 0 ? "CHOP↓ +0.05" :
+                         verSpreadVolDom  and verSpreadSlope < 0 ? "VOL↓  −0.05" :
+                         verSpreadVolDom  and verSpreadSlope > 0 ? "VOL↑  +0.08" : "NEUTRAL",
+               text_color=spreadModifier > 0 ? color.lime :
+                          spreadModifier < 0 ? color.red : color.gray)
+
+    // WAE
+    table.cell(t, 0, 13, "WAE",     bgcolor=color.purple, text_color=color.white)
+    table.cell(t, 1, 13, "Regime",                        text_color=color.white)
+    table.cell(t, 2, 13, waeExpansion ? "EXPAND" : "COMPRESS",
+               text_color=waeExpansion ? color.lime : color.yellow)
+
+    // HTF
+    table.cell(t, 0, 14, "HTF",     bgcolor=color.teal,   text_color=color.white)
+    table.cell(t, 1, 14, "State",                         text_color=color.white)
+    table.cell(t, 2, 14, htfStateStr,
+               text_color=htfTrending ? color.lime : htfRanging ? color.red :
+                          htfDeteriorate ? color.yellow : color.gray)
+
+    table.cell(t, 0, 15, "HTF",     bgcolor=color.teal,   text_color=color.white)
+    table.cell(t, 1, 15, "VER/VWER",                      text_color=color.white)
+    table.cell(t, 2, 15, str.tostring(htfVER, "#.##") + " / " + str.tostring(htfVWER, "#.##"),
+               text_color=htfTrending ? color.lime : htfRanging ? color.red : color.yellow)
+
+    // Score breakdown
+    table.cell(t, 0, 16, "SCORE",   bgcolor=color.black,  text_color=color.white)
+    table.cell(t, 1, 16, "JMA tier",                      text_color=color.white)
+    table.cell(t, 2, 16, str.tostring(jmaTierScore, "#.##"),
+               text_color=jmaTierScore > 0.6 ? color.lime : jmaTierScore < 0.4 ? color.red : color.yellow)
+
+    table.cell(t, 0, 17, "SCORE",   bgcolor=color.black,  text_color=color.white)
+    table.cell(t, 1, 17, "CVD tier",                      text_color=color.white)
+    table.cell(t, 2, 17, str.tostring(cvdTierScore, "#.##"),
+               text_color=cvdTierScore > 0.6 ? color.lime : cvdTierScore < 0.4 ? color.red : color.yellow)
+
+    table.cell(t, 0, 18, "SCORE",   bgcolor=color.black,  text_color=color.white)
+    table.cell(t, 1, 18, "STR tier",                      text_color=color.white)
+    table.cell(t, 2, 18, str.tostring(structTierScore, "#.##"),
+               text_color=structTierScore > 0.6 ? color.lime : structTierScore < 0.4 ? color.red : color.yellow)
+
+    table.cell(t, 0, 19, "SCORE",   bgcolor=color.black,  text_color=color.white)
+    table.cell(t, 1, 19, "Spread Δ",                      text_color=color.white)
+    table.cell(t, 2, 19, str.tostring(spreadModifier, "#.###"),
+               text_color=spreadModifier > 0 ? color.lime : spreadModifier < 0 ? color.red : color.gray)
+
+    table.cell(t, 0, 20, "SCORE",   bgcolor=color.black,  text_color=color.white)
+    table.cell(t, 1, 20, "Raw Linear",                    text_color=color.white)
+    table.cell(t, 2, 20, str.tostring(rawLinear, "#.##"),
+               text_color=rawLinear > 0.65 ? color.lime : rawLinear < 0.35 ? color.red : color.yellow)
+
+    table.cell(t, 0, 21, "FINAL",   bgcolor=color.navy,   text_color=color.white)
+    table.cell(t, 1, 21, "SCORE",                         text_color=color.white)
+    table.cell(t, 2, 21, str.tostring(finalScore, "#.##"),
+               text_color=finalScore > 0.70 ? color.lime :
+                          finalScore > 0.50 ? color.yellow :
+                          finalScore > 0.30 ? color.orange : color.red)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DATA WINDOW PLOTS (Non-visual reference values)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plot(jma,          "JMA",          color=color.new(color.white,   0), display=display.data_window)
+plot(jmaSlope,     "JMA Slope",    color=color.new(color.yellow,  0), display=display.data_window)
+plot(jmaAccel,     "JMA Accel",    color=color.new(color.orange,  0), display=display.data_window)
+plot(cvd,          "CVD",          color=color.new(color.aqua,    0), display=display.data_window)
+plot(ver,          "VER 1m",       color=color.new(color.lime,    0), display=display.data_window)
+plot(vwer,         "VWER 1m",      color=color.new(color.fuchsia, 0), display=display.data_window)
+plot(verSpread,    "VER Spread",   color=color.new(color.yellow,  0), display=display.data_window)
+plot(htfVER,       "VER HTF",      color=color.new(color.green,   0), display=display.data_window)
+plot(htfVWER,      "VWER HTF",     color=color.new(color.teal,    0), display=display.data_window)
+plot(rawLinear,    "Score Raw",    color=color.new(color.gray,    0), display=display.data_window)
+plot(spreadModifier, "Spread Mod", color=color.new(color.orange,  0), display=display.data_window)

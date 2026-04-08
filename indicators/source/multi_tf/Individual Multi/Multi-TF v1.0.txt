@@ -1,0 +1,582 @@
+//@version=5
+indicator("Multi-TF Scalper Edition — Long Only", overlay=true, max_bars_back=5000)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpHTF1 = "HTF1 — 1hr Kalman Regime"
+htf1_tf          = input.timeframe("60",  "HTF1 Timeframe",           group=grpHTF1)
+kalman_q         = input.float(0.001, "Process Noise (Q)",   step=0.0001, group=grpHTF1, tooltip="How fast true trend can change. Lower = more stable.")
+kalman_r         = input.float(1.0,   "Measurement Noise (R)", step=0.1,  group=grpHTF1, tooltip="Price jitter to filter out. Higher = smoother.")
+mad_len          = input.int(24, "MAD Bands Length", minval=5, group=grpHTF1, tooltip="Lookback for Mean Absolute Deviation bands")
+mad_mult         = input.float(2.0, "MAD Multiplier", step=0.1, group=grpHTF1)
+htf1_dim_transp  = input.int(85, "Inside Bands Transparency", minval=50, maxval=95, group=grpHTF1)
+htf1_glow_transp = input.int(50, "Outside Bands Transparency (Glow)", minval=20, maxval=80, group=grpHTF1)
+col_htf1_bull    = input.color(color.green, "Bullish Bias Color", group=grpHTF1)
+col_htf1_bear    = input.color(color.red,   "Bearish Bias Color", group=grpHTF1)
+col_htf1_line    = input.color(color.new(color.blue, 0), "Kalman Line Color", group=grpHTF1)
+col_htf1_upper   = input.color(color.new(color.gray, 60), "MAD Upper Band Color", group=grpHTF1)
+col_htf1_lower   = input.color(color.new(color.gray, 60), "MAD Lower Band Color", group=grpHTF1)
+
+grpHTF2 = "HTF2 — 5min Super Smoother (FASTER)"
+htf2_tf       = input.timeframe("5", "HTF2 Timeframe",        group=grpHTF2, tooltip="Changed from 15min to 5min for scalping")
+ss_period     = input.int(4,  "Super Smoother Period", minval=2, group=grpHTF2, tooltip="Reduced from 6 to 4 for faster response")
+pressure_len  = input.int(7, "Pressure Length",       minval=3, group=grpHTF2, tooltip="Reduced from 10 to 7")
+pressure_mult = input.float(1.5, "Pressure Band Mult", step=0.1, group=grpHTF2)
+chop_threshold= input.float(0.25, "Chop Threshold",     step=0.05, group=grpHTF2, tooltip="Lowered from 0.30 to 0.25 for tighter detection")
+col_htf2_trend_up = input.color(color.new(color.green, 75), "Trending Up Color",   group=grpHTF2)
+col_htf2_trend_dn = input.color(color.new(color.red,   75), "Trending Down Color", group=grpHTF2)
+col_htf2_chop     = input.color(color.new(color.gray,  90), "Chop Color",          group=grpHTF2)
+col_htf2_normal   = input.color(color.new(color.orange, 0), "SS Line (Normal)",    group=grpHTF2)
+col_htf2_ob       = input.color(color.new(color.red,    0), "SS Line (Overbought)", group=grpHTF2)
+col_htf2_os       = input.color(color.new(color.green,  0), "SS Line (Oversold)",   group=grpHTF2)
+col_htf2_press    = input.color(color.new(color.purple, 60), "Pressure Bands Color", group=grpHTF2)
+
+grpCTF = "Chart TF — JMA/iTrend (FASTER)"
+jma_len       = input.int(12,   "JMA Length",    minval=1, group=grpCTF, tooltip="Reduced from 16 to 12 for faster response")
+jma_phase     = input.int(40,   "JMA Phase",     minval=-100, maxval=100, group=grpCTF, tooltip="Increased from 30 to 40 for more reactivity")
+jma_power     = input.int(2,    "JMA Power",     minval=1, maxval=10, group=grpCTF)
+itrend_alpha  = input.float(0.09, "iTrend Alpha", step=0.01, group=grpCTF, tooltip="Increased from 0.07 to 0.09 for faster inflection detection")
+accel_len     = input.int(2,    "Acceleration Smooth", minval=1, group=grpCTF, tooltip="Reduced from 3 to 2")
+slope_len     = input.int(2,    "Slope Lookback",      minval=1, group=grpCTF)
+col_strong_up = input.color(color.new(color.lime,   0), "Strong Up (Slope+ / Accel+)",  group=grpCTF)
+col_weak_up   = input.color(color.new(color.yellow, 0), "Weak Up (Slope+ / Accel−)",    group=grpCTF)
+col_slowing_dn= input.color(color.new(color.aqua,   0), "Slowing Dn (Slope− / Accel+)", group=grpCTF)
+col_down      = input.color(color.new(color.red,    0), "Down (Slope− / Accel−)",       group=grpCTF)
+
+grpDiv = "Divergence Arrows (FASTER)"
+div_lookback = input.int(7, "Pivot Lookback", minval=3, group=grpDiv, tooltip="Reduced from 10 to 7 for faster detection")
+col_div_bull = input.color(color.new(color.green, 0), "Bullish Divergence ↑", group=grpDiv)
+col_div_bear = input.color(color.new(color.red,   0), "Bearish Divergence ↓", group=grpDiv)
+
+grpCVD = "CVD Triangles (FASTER)"
+ltf_tf    = input.timeframe("10S", "LTF Timeframe", group=grpCVD, tooltip="Changed from 30S to 10S for faster flip detection")
+cvd_len   = input.int(10, "CVD Window Length", minval=5, group=grpCVD, tooltip="Reduced from 20 to 10")
+cvd_smooth= input.int(2,  "CVD Smoothing",     minval=1, group=grpCVD, tooltip="Reduced from 3 to 2")
+col_cvd_bull = input.color(color.new(color.green, 0), "Bullish Flip ▲", group=grpCVD)
+col_cvd_bear = input.color(color.new(color.red,   0), "Bearish Flip ▼", group=grpCVD)
+
+grpMicro = "Microstructure (NEW)"
+enable_micro = input.bool(true, "Enable Microstructure Indicators", group=grpMicro)
+vol_accel_len = input.int(5, "Volume Acceleration Length", minval=2, group=grpMicro)
+vol_surge_mult = input.float(2.0, "Volume Surge Multiplier", step=0.5, minval=1.0, group=grpMicro, tooltip="Volume > avg * mult = surge")
+tape_speed_len = input.int(10, "Tape Speed Length", minval=3, group=grpMicro, tooltip="Measures bars/minute acceleration")
+show_vol_surge = input.bool(true, "Show Volume Surge Markers", group=grpMicro)
+show_tape_speed = input.bool(true, "Show Tape Speed Acceleration", group=grpMicro)
+
+grpViz = "Display"
+show_htf1    = input.bool(true, "Show HTF1 Kalman + Bands", group=grpViz)
+show_htf2    = input.bool(true, "Show HTF2 SS + Bands",     group=grpViz)
+show_jma     = input.bool(true, "Show CTF JMA/iTrend Line", group=grpViz)
+show_fills   = input.bool(true, "Show Background Fills",    group=grpViz)
+show_arrows  = input.bool(true, "Show Divergence Arrows",   group=grpViz)
+show_triangles = input.bool(true, "Show CVD Triangles",     group=grpViz)
+long_only_mode = input.bool(true, "LONG ONLY MODE (Hide bearish setups)", group=grpViz)
+
+grpGrade = "Setup Quality Grading (SCALPER)"
+enable_grading = input.bool(true, "Enable Setup Grading", group=grpGrade)
+show_dashboard = input.bool(true, "Show Grade Dashboard", group=grpGrade)
+show_elite_marker = input.bool(true, "Show A+ Elite Markers", group=grpGrade)
+elite_boost = input.bool(true, "Brighten Background on A+ Setup", group=grpGrade)
+elite_threshold = input.float(80, "A+ Elite Threshold", step=1, minval=70, maxval=100, group=grpGrade, tooltip="Lowered from 85 to 80 for scalping")
+strong_threshold = input.float(65, "A Strong Threshold", step=1, minval=50, maxval=85, group=grpGrade, tooltip="Lowered from 70 to 65")
+moderate_threshold = input.float(50, "B Moderate Threshold", step=1, minval=40, maxval=70, group=grpGrade, tooltip="Lowered from 55 to 50")
+
+// Weighting (microstructure added)
+weight_htf1 = input.float(25, "HTF1 Weight %", step=5, minval=0, maxval=50, group=grpGrade, tooltip="Reduced from 30 to make room for microstructure")
+weight_htf2 = input.float(25, "HTF2 Weight %", step=5, minval=0, maxval=50, group=grpGrade, tooltip="Reduced from 30")
+weight_ctf = input.float(25, "CTF Weight %", step=5, minval=0, maxval=50, group=grpGrade)
+weight_price = input.float(10, "Price Position Weight %", step=5, minval=0, maxval=30, group=grpGrade, tooltip="Reduced from 15")
+weight_micro = input.float(15, "Microstructure Weight %", step=5, minval=0, maxval=30, group=grpGrade, tooltip="NEW - volume/tape quality")
+
+// Alert
+alert_on_elite = input.bool(true, "Alert on A+ Setup", group=grpGrade)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HELPERS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+jma_func(_src, _length, _phase, _power) =>
+    phaseRatio = _phase < -100 ? 0.5 : _phase > 100 ? 2.5 : _phase / 100 + 1.5
+    beta  = 0.45 * (_length - 1) / (0.45 * (_length - 1) + 2)
+    alpha = math.pow(beta, _power)
+    var float e0 = na
+    var float e1 = na
+    var float e2 = na
+    var float jv = na
+    e0 := (1 - alpha) * _src + alpha * nz(e0[1], _src)
+    e1 := (_src - e0) * (1 - beta) + beta * nz(e1[1], 0)
+    e2 := (e0 + phaseRatio * e1 - nz(jv[1], _src)) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1], 0)
+    jv  := e2 + nz(jv[1], _src)
+    jv
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HTF1 SECURITY — 1hr KALMAN + MAD BANDS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+htf1_block() =>
+    var float kalman_est = na
+    var float kalman_p   = 1.0
+    
+    if na(kalman_est)
+        kalman_est := close
+    
+    pred_est = kalman_est
+    pred_p   = kalman_p + kalman_q
+    
+    K = pred_p / (pred_p + kalman_r)
+    kalman_est := pred_est + K * (close - pred_est)
+    kalman_p   := (1 - K) * pred_p
+    
+    median_val = ta.median(close, mad_len)
+    float mad_sum = 0.0
+    for i = 0 to mad_len - 1
+        mad_sum += math.abs(close[i] - median_val)
+    mad = mad_sum / mad_len
+    
+    upper = kalman_est + mad * mad_mult
+    lower = kalman_est - mad * mad_mult
+    
+    slope = kalman_est - nz(kalman_est[1])
+    
+    [kalman_est, upper, lower, slope]
+
+[htf1_line, htf1_upper, htf1_lower, htf1_slope] = request.security(
+     syminfo.tickerid, htf1_tf, htf1_block(), lookahead=barmerge.lookahead_off)
+
+htf1_bias_up = htf1_slope > 0
+htf1_bias_dn = htf1_slope < 0
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HTF2 SECURITY — 5min SUPER SMOOTHER + PRESSURE BANDS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+htf2_block() =>
+    a1 = math.exp(-math.sqrt(2.0) * math.pi / ss_period)
+    b1 = 2.0 * a1 * math.cos(math.sqrt(2.0) * math.pi / ss_period)
+    c2 = b1
+    c3 = -(a1 * a1)
+    c1 = 1.0 - c2 - c3
+    
+    var float ss = na
+    ss := na(ss[1]) or na(ss[2]) ? close :
+          c1 * (close + nz(close[1])) * 0.5 + c2 * nz(ss[1]) + c3 * nz(ss[2])
+    
+    ss_slope = ss - nz(ss[1])
+    
+    atr_val = ta.atr(14)
+    net = math.abs(ss_slope - ss_slope[pressure_len])
+    float tot = 0.0
+    for i = 0 to pressure_len - 1
+        tot += math.abs(ss_slope[i] - nz(ss_slope[i + 1]))
+    eff = tot != 0 ? net / tot : 0.0
+    pressure = ta.ema((ss_slope - nz(ss_slope[1])) * eff, pressure_len)
+    norm_pressure = atr_val != 0 ? pressure / atr_val : 0.0
+    
+    press_raw = norm_pressure * atr_val
+    press_std = ta.stdev(press_raw, pressure_len) * pressure_mult
+    
+    upper = ss + press_std
+    lower = ss - press_std
+    
+    [ss, upper, lower, norm_pressure, ss_slope]
+
+[htf2_line, htf2_upper, htf2_lower, htf2_norm_press, htf2_slope] = request.security(
+     syminfo.tickerid, htf2_tf, htf2_block(), lookahead=barmerge.lookahead_off)
+
+htf2_trending = math.abs(htf2_norm_press) > chop_threshold
+htf2_chop     = math.abs(htf2_norm_press) <= chop_threshold
+
+outside_upper = close > htf1_upper
+outside_lower = close < htf1_lower
+inside_bands  = not outside_upper and not outside_lower
+
+htf2_overbought = close > htf2_upper
+htf2_oversold   = close < htf2_lower
+
+htf2_line_color = htf2_overbought ? col_htf2_ob : htf2_oversold   ? col_htf2_os : col_htf2_normal
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CHART TF — JMA + iTrend
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+jma = jma_func(close, jma_len, jma_phase, jma_power)
+jma_slope_raw = jma - jma[slope_len]
+jma_accel_raw = jma_slope_raw - jma_slope_raw[1]
+jma_accel = ta.ema(jma_accel_raw, accel_len)
+
+slope_pos = jma_slope_raw > 0
+slope_neg = jma_slope_raw < 0
+accel_pos = jma_accel > 0
+accel_neg = jma_accel < 0
+
+jma_green  = slope_pos and accel_pos
+jma_yellow = slope_pos and accel_neg
+jma_blue   = slope_neg and accel_pos
+jma_red    = slope_neg and accel_neg
+
+iTrend_func(src, alpha) =>
+    var float it = na
+    it := (alpha - (alpha*alpha)/4) * src + 
+          0.5 * alpha * alpha * nz(src[1]) - 
+          (alpha - 0.75*alpha*alpha) * nz(src[2]) + 
+          2 * (1 - alpha) * nz(it[1]) - 
+          (1 - alpha) * (1 - alpha) * nz(it[2])
+    it
+
+iTrend = iTrend_func(close, itrend_alpha)
+iTrend_cross = ta.cross(iTrend, 0)
+
+jma_weakening = jma_accel < 0 or math.abs(jma_slope_raw) < math.abs(jma_slope_raw[1])
+iTrend_early_signal = iTrend_cross and jma_weakening
+
+jma_color = iTrend_early_signal ? (iTrend > 0 ? col_weak_up : col_slowing_dn) : jma_green  ? col_strong_up : jma_yellow ? col_weak_up   : jma_blue   ? col_slowing_dn : col_down
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DIVERGENCE DETECTION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+price_ph = ta.pivothigh(high, div_lookback, div_lookback)
+price_pl = ta.pivotlow(low,   div_lookback, div_lookback)
+
+jma_ph = ta.pivothigh(jma, div_lookback, div_lookback)
+jma_pl = ta.pivotlow(jma,  div_lookback, div_lookback)
+
+var float last_price_high = na
+var float prev_price_high = na
+var float last_jma_high   = na
+var float prev_jma_high   = na
+
+var float last_price_low  = na
+var float prev_price_low  = na
+var float last_jma_low    = na
+var float prev_jma_low    = na
+
+if not na(price_ph)
+    prev_price_high := last_price_high
+    last_price_high := price_ph
+if not na(jma_ph)
+    prev_jma_high := last_jma_high
+    last_jma_high := jma_ph
+
+if not na(price_pl)
+    prev_price_low := last_price_low
+    last_price_low := price_pl
+if not na(jma_pl)
+    prev_jma_low := last_jma_low
+    last_jma_low := jma_pl
+
+bearish_div = not na(last_price_high) and not na(prev_price_high) and
+              not na(last_jma_high)   and not na(prev_jma_high)   and
+              (last_price_high > prev_price_high) and
+              (last_jma_high   < prev_jma_high)
+
+bullish_div = not na(last_price_low) and not na(prev_price_low) and
+              not na(last_jma_low)   and not na(prev_jma_low)   and
+              (last_price_low < prev_price_low) and
+              (last_jma_low   > prev_jma_low)
+
+bearish_div_signal = bearish_div and not na(price_ph)
+bullish_div_signal = bullish_div and not na(price_pl)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CVD FLIP DETECTION (FASTER)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ltf_h = request.security_lower_tf(syminfo.tickerid, ltf_tf, high)
+ltf_l = request.security_lower_tf(syminfo.tickerid, ltf_tf, low)
+ltf_c = request.security_lower_tf(syminfo.tickerid, ltf_tf, close)
+ltf_v = request.security_lower_tf(syminfo.tickerid, ltf_tf, volume)
+
+float delta_agg = 0.0
+if array.size(ltf_h) > 0
+    for i = 0 to array.size(ltf_h) - 1
+        h = array.get(ltf_h, i)
+        l = array.get(ltf_l, i)
+        c = array.get(ltf_c, i)
+        v = array.get(ltf_v, i)
+        delta_agg += (h != l) ? v * (2 * c - h - l) / (h - l) : 0.0
+
+cvd = ta.ema(math.sum(delta_agg, cvd_len), cvd_smooth)
+
+cvd_bullish_flip = ta.crossover(cvd, 0)
+cvd_bearish_flip = ta.crossunder(cvd, 0)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// MICROSTRUCTURE INDICATORS (NEW)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+float vol_surge_score = 0.0
+float tape_speed_score = 0.0
+float micro_score = 50.0  // Default neutral score
+
+if enable_micro
+    // Volume Acceleration - detects surge without L2
+    vol_avg = ta.sma(volume, vol_accel_len)
+    vol_surge = volume > (vol_avg * vol_surge_mult)
+    
+    // Volume quality (surge + directional)
+    vol_surge_bullish = vol_surge and close > open
+    vol_surge_bearish = vol_surge and close < open
+    
+    vol_surge_score := vol_surge_bullish ? 100.0 : vol_surge_bearish ? 0.0 : 50.0
+    
+    // Tape Speed - measures bars/minute acceleration
+    // Higher speed = more activity = potential breakout
+    var int bar_count = 0
+    var int last_minute = na
+    
+    current_minute = minute(time)
+    if na(last_minute)
+        last_minute := current_minute
+    
+    if current_minute != last_minute
+        last_minute := current_minute
+        bar_count := 1
+    else
+        bar_count += 1
+    
+    // Historical bars per minute
+    var float bars_per_min_avg = 1.0
+    bars_per_min_avg := ta.ema(bar_count, tape_speed_len)
+    
+    // Acceleration ratio
+    tape_accel = bars_per_min_avg > 0 ? bar_count / bars_per_min_avg : 1.0
+    
+    // Score tape speed
+    tape_speed_score := tape_accel > 1.3 ? 100.0 : tape_accel > 1.1 ? 75.0 : tape_accel > 0.9 ? 50.0 : 25.0 
+    
+    // Combined microstructure score
+    micro_score := (vol_surge_score * 0.6) + (tape_speed_score * 0.4)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SETUP QUALITY GRADING SYSTEM (SCALPER EDITION)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+float setup_score = na
+string setup_grade = na
+
+if enable_grading
+    float total_weight = weight_htf1 + weight_htf2 + weight_ctf + weight_price + weight_micro
+    float w1 = weight_htf1 / total_weight
+    float w2 = weight_htf2 / total_weight
+    float w3 = weight_ctf / total_weight
+    float w4 = weight_price / total_weight
+    float w5 = weight_micro / total_weight
+    
+    // Factor 1: HTF1 Alignment
+    jma_bullish = jma_slope_raw > 0
+    jma_bearish = jma_slope_raw < 0
+    
+    htf1_aligned = (htf1_bias_up and jma_bullish) or (htf1_bias_dn and jma_bearish)
+    htf1_score = htf1_aligned ? 100.0 : 0.0
+    
+    // Factor 2: HTF2 Alignment
+    htf2_bullish = htf2_slope > 0
+    htf2_bearish = htf2_slope < 0
+    
+    htf2_aligned = htf2_trending and ((htf2_bullish and jma_bullish) or (htf2_bearish and jma_bearish))
+    htf2_partial = htf2_chop
+    
+    htf2_score = htf2_aligned ? 100.0 : htf2_partial ? 50.0 : 0.0
+    
+    // Factor 3: CTF Quality
+    ctf_score = jma_green ? 100.0 : jma_yellow ? 70.0 : jma_blue ? 30.0 : 0.0
+    
+    // Factor 4: Price Position
+    price_score = 100.0
+    
+    if htf2_overbought
+        price_score := 30.0
+    else if htf2_oversold
+        price_score := 70.0
+    
+    if outside_upper
+        price_score := math.min(price_score, 50.0)
+    
+    // Factor 5: Microstructure (NEW)
+    micro_score_final = micro_score
+    
+    // Calculate weighted setup score
+    setup_score := (htf1_score * w1) + (htf2_score * w2) + (ctf_score * w3) + (price_score * w4) + (micro_score_final * w5)
+    setup_score := math.max(0.0, math.min(100.0, setup_score))
+    
+    // Assign grade
+    setup_grade := setup_score >= elite_threshold ? "A+" :
+                   setup_score >= strong_threshold ? "A" :
+                   setup_score >= moderate_threshold ? "B" :
+                   "C"
+
+// LONG ONLY GATE - Only show setups when JMA bullish
+jma_bullish_confirmed = jma_slope_raw > 0
+setup_valid = not long_only_mode or jma_bullish_confirmed
+
+elite_setup = enable_grading and setup_score >= elite_threshold and setup_valid
+elite_setup_new = elite_setup and not elite_setup[1]
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PLOT HTF LINES
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+plot(show_htf1 ? htf1_line : na,  "HTF1 Kalman",   color=col_htf1_line, linewidth=2)
+plot(show_htf1 ? htf1_upper : na, "HTF1 MAD Upper", color=col_htf1_upper, linewidth=1)
+plot(show_htf1 ? htf1_lower : na, "HTF1 MAD Lower", color=col_htf1_lower, linewidth=1)
+
+plot(show_htf2 ? htf2_line : na,  "HTF2 SS",        color=htf2_line_color, linewidth=2)
+plot(show_htf2 ? htf2_upper : na, "HTF2 Press Upper", color=col_htf2_press, linewidth=1, style=plot.style_circles)
+plot(show_htf2 ? htf2_lower : na, "HTF2 Press Lower", color=col_htf2_press, linewidth=1, style=plot.style_circles)
+
+plot(show_jma ? jma : na, "CTF JMA/iTrend", color=jma_color, linewidth=3)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FILL SYSTEM (LONG ONLY GATED)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+htf1_bull_dim  = color.new(col_htf1_bull, htf1_dim_transp)
+htf1_bull_glow = color.new(col_htf1_bull, htf1_glow_transp)
+htf1_bear_dim  = color.new(col_htf1_bear, htf1_dim_transp)
+htf1_bear_glow = color.new(col_htf1_bear, htf1_glow_transp)
+
+elite_boost_active = elite_boost and elite_setup
+htf1_bull_elite = color.new(col_htf1_bull, 30)
+htf1_bear_elite = color.new(col_htf1_bear, 30)
+
+htf2_trend_up  = col_htf2_trend_up
+htf2_trend_dn  = col_htf2_trend_dn
+htf2_chop_col  = col_htf2_chop
+
+atr_chart = ta.atr(14)
+float chart_high = htf1_upper + (atr_chart * 3)
+float chart_low  = htf1_lower - (atr_chart * 3)
+
+p_top   = plot(show_fills ? chart_high  : na, display=display.none)
+p_upper = plot(show_fills ? htf1_upper  : na, display=display.none)
+p_lower = plot(show_fills ? htf1_lower  : na, display=display.none)
+p_bot   = plot(show_fills ? chart_low   : na, display=display.none)
+
+color _off = color.new(color.white, 100)
+
+// LONG ONLY: Only show fills when setup is valid (JMA bullish)
+show_bull_fills = setup_valid
+
+// HTF1 fills - gated by long_only mode
+fill(p_top, p_upper, 
+     color = not show_fills or not show_bull_fills ? _off :
+             elite_boost_active and htf1_bias_up ? htf1_bull_elite :
+             htf1_bias_up and outside_upper ? htf1_bull_glow :
+             htf1_bias_up                   ? htf1_bull_dim  :
+             htf1_bias_dn and outside_upper ? htf1_bear_glow :
+                                              htf1_bear_dim,
+     title="HTF1 Above")
+
+fill(p_lower, p_bot,
+     color = not show_fills or not show_bull_fills ? _off :
+             elite_boost_active and htf1_bias_up ? htf1_bull_elite :
+             htf1_bias_up and outside_lower ? htf1_bull_glow :
+             htf1_bias_up                   ? htf1_bull_dim  :
+             htf1_bias_dn and outside_lower ? htf1_bear_glow :
+                                              htf1_bear_dim,
+     title="HTF1 Below")
+
+// HTF2 fills - also gated by long_only mode
+fill(p_upper, p_lower,
+     color = not show_fills or not show_bull_fills ? _off :
+             htf2_chop                           ? htf2_chop_col :
+             htf2_trending and htf2_slope > 0    ? htf2_trend_up :
+             htf2_trending and htf2_slope < 0    ? htf2_trend_dn :
+                                                   htf2_chop_col,
+     title="HTF2 Inside")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PLOT SYMBOLS (LONG ONLY GATED)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Only show bullish signals in long only mode
+plotshape(show_arrows and bullish_div_signal and setup_valid, "Bullish Divergence",
+          style=shape.arrowup, location=location.belowbar, color=col_div_bull, size=size.small)
+
+plotshape(show_triangles and cvd_bullish_flip and setup_valid, "CVD Bullish Flip",
+          style=shape.triangleup, location=location.belowbar, color=col_cvd_bull, size=size.normal)
+
+// Microstructure markers
+vol_surge_bull = enable_micro and vol_surge_score > 90 and setup_valid
+tape_hot = enable_micro and tape_speed_score > 90 and setup_valid
+
+plotshape(show_vol_surge and vol_surge_bull, "Volume Surge",
+          style=shape.circle, location=location.belowbar, color=color.new(color.white, 30), size=size.tiny)
+
+plotchar(show_tape_speed and tape_hot, "Hot Tape",
+          char="⚡", location=location.belowbar, color=color.new(color.yellow, 0), size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ELITE SETUP MARKER (LONG ONLY)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+plotshape(show_elite_marker and elite_setup_new, 
+     title="Elite Setup Glow", 
+     location=location.belowbar, 
+     style=shape.circle, 
+     size=size.huge, 
+     color=color.new(color.yellow, 70))
+
+plotshape(show_elite_marker and elite_setup_new, 
+     title="Elite Setup", 
+     location=location.belowbar, 
+     style=shape.flag, 
+     size=size.normal, 
+     color=color.new(color.yellow, 0),
+     text="A+",
+     textcolor=color.black)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SETUP GRADE DASHBOARD (SCALPER)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if show_dashboard and enable_grading and barstate.islast
+    var table grade_table = table.new(position.top_right, 2, 5, 
+         border_width=2, 
+         border_color=color.new(color.gray, 50),
+         frame_width=2,
+         frame_color=color.new(color.gray, 70))
+    
+    grade_color = setup_grade == "A+" ? color.new(color.yellow, 0) :
+                  setup_grade == "A" ? color.new(color.green, 0) :
+                  setup_grade == "B" ? color.new(color.orange, 0) :
+                  color.new(color.red, 30)
+    
+    // Header
+    table.cell(grade_table, 0, 0, "SCALP", text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.large)
+    table.cell(grade_table, 1, 0, "SETUP", text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.large)
+    
+    // Grade
+    table.cell(grade_table, 0, 1, "Grade", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.normal)
+    table.cell(grade_table, 1, 1, setup_grade, text_color=color.black, bgcolor=grade_color, text_size=size.huge)
+    
+    // Score
+    table.cell(grade_table, 0, 2, "Score", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.normal)
+    table.cell(grade_table, 1, 2, str.tostring(setup_score, "#") + "%", text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.large)
+    
+    // Microstructure
+    table.cell(grade_table, 0, 3, "Micro", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    micro_text = micro_score > 75 ? "HOT" : micro_score > 60 ? "GOOD" : micro_score > 40 ? "OK" : "SLOW"
+    micro_color = micro_score > 75 ? color.green : micro_score > 60 ? color.yellow : micro_score > 40 ? color.orange : color.red
+    table.cell(grade_table, 1, 3, micro_text, text_color=color.white, bgcolor=micro_color, text_size=size.normal)
+    
+    // Mode
+    table.cell(grade_table, 0, 4, "Mode", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    table.cell(grade_table, 1, 4, long_only_mode ? "LONG" : "BOTH", text_color=color.white, bgcolor=long_only_mode ? color.green : color.blue, text_size=size.normal)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ALERT (LONG ONLY)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if alert_on_elite and elite_setup_new and barstate.isconfirmed
+    alert_msg = "⭐ A+ SCALP SETUP (LONG)\n" +
+         "Score: " + str.tostring(setup_score, "#") + "%\n" +
+         "HTF1: " + (htf1_bias_up ? "BULLISH" : "BEARISH") + "\n" +
+         "HTF2: " + (htf2_trending ? "TRENDING" : "CHOP") + "\n" +
+         "CTF: " + (jma_green ? "STRONG UP" : jma_yellow ? "WEAK UP" : jma_blue ? "SLOWING" : "DOWN") + "\n" +
+         "Micro: " + (micro_score > 75 ? "HOT" : micro_score > 60 ? "GOOD" : "OK")
+    
+    alert(alert_msg, alert.freq_once_per_bar_close)

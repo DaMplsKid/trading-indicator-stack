@@ -1,0 +1,348 @@
+//@version=5
+
+indicator(title="[blackcat] L3 Improved Dual Ehlers BPF for Volatility Detection", shorttitle="L3 IDEBF VD", overlay=false, max_labels_count=500)
+
+// Import the dc_ta library for dominant cycle calculations
+import blackcat1402/dc_ta/2 as dc_ta
+
+
+// ============================================================================
+// INPUT PARAMETERS
+// ============================================================================
+
+// Price and Source Settings
+priceSource = input(close, title="Price Source")
+useHighLow = input.bool(false, title="Use High/Low for Cycle Detection")
+
+// Calculation Method Selection
+calculationMethod = input.string("both", title="Calculation Method", options=["l1", "l2", "both"])
+
+// Dominant Cycle Settings
+dominantCycleMethod = input.string("HoDyDC", title="Dominant Cycle Method", 
+ options=["HoDyDC", "PhAcDC", "DuDiDC", "CycPer", "BPZC", "AutoPer", "DFTDC"])
+cyclePart = input.float(0.5, title="Cycle Part", minval=0.1, maxval=0.9, step=0.05)
+
+// Subdominant Cycle Settings
+subdominantRatio = input.float(0.6, title="Subdominant Cycle Ratio", minval=0.1, maxval=0.9, step=0.05)
+subdominantFixed = input.bool(false, title="Use Fixed Subdominant Period")
+subdominantFixedPeriod = input.int(10, title="Fixed Subdominant Period", minval=5, maxval=50)
+
+// Filter Bandwidth Settings
+dominantBandwidth = input.float(0.3, title="Dominant Filter Bandwidth", minval=0.1, maxval=1.0, step=0.05)
+subdominantBandwidth = input.float(0.3, title="Subdominant Filter Bandwidth", minval=0.1, maxval=1.0, step=0.05)
+
+// Mixing Settings
+mixingMethod = input.string("weighted", title="Mixing Method", 
+ options=["weighted", "sum", "difference", "dominant", "subdominant", "adaptive"])
+dominantWeight = input.float(0.6, title="Dominant Weight", minval=0.0, maxval=1.0, step=0.05)
+adaptiveThreshold = input.float(0.1, title="Adaptive Threshold", minval=0.01, maxval=0.5, step=0.01)
+
+// Smoothing Settings
+smoothingMethod = input.string("sma", title="Smoothing Method", 
+ options=["sma", "ema", "hma"])
+smoothingLength = input.int(5, title="Smoothing Length", minval=1, maxval=20)
+
+// Visualization Settings
+plotDivergence = input.bool(true, title="Plot Divergence")
+plotIndividualFilters = input.bool(false, title="Plot Individual Filters")
+plotCycleInfo = input.bool(true, title="Plot Cycle Information")
+showZeroLine = input.bool(true, title="Show Zero Line")
+showFill = input.bool(true, title="Show Fill")
+
+// Color Settings
+dominantColor = input.color(color.blue, title="Dominant Filter Color")
+subdominantColor = input.color(color.red, title="Subdominant Filter Color")
+combinedColor = input.color(color.green, title="Combined Filter Color")
+l1Color = input.color(color.yellow, title="L1 Signal Color")
+l2Color = input.color(color.purple, title="L2 Signal Color")
+combinedL3Color = input.color(color.orange, title="Combined L3 Signal Color")
+bullColor = input.color(color.green, title="Bullish Divergence Color")
+bearColor = input.color(color.red, title="Bearish Divergence Color")
+zeroLineColor = input.color(color.gray, title="Zero Line Color")
+textColor = input.color(color.white, title="Text Color")
+noneColor = color.new(color.white, 100)
+
+rangeUpper = input.int(60, title="Max Lookback Range", group="Divergence Settings")
+rangeLower = input.int(5, title="Min Lookback Range", group="Divergence Settings")
+
+_inRange(cond) =>
+    bars = ta.barssince(cond == true)
+    rangeLower <= bars and bars <= rangeUpper
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Function to calculate bandpass filter - L1 method (0~1 range)
+calculateBandpassFilterL1(price, period, bandwidth) =>
+    // Constants
+    var alpha2 = 0.0
+    var HP = 0.0
+    var gamma1 = 0.0
+    var alpha1 = 0.0
+    var beta1 = 0.0
+    var BP = 0.0
+    var Peak = 0.0
+    var Signal = 0.0
+    pi = 2 * math.asin(1)
+
+    // Calculate alpha2 and HP
+    alpha2 := (math.cos(.25 * bandwidth * 2 * pi / period) + math.sin(.25 * bandwidth * 2 * pi / period) - 1) / math.cos(.25 * bandwidth * 2 * pi / period)
+    HP := (1 + alpha2 / 2) * (price - nz(price[1])) + (1 - alpha2) * nz(HP[1])
+
+    // Calculate gamma1, alpha1, beta1 and BP
+    beta1 := math.cos(2 * pi / period)
+    gamma1 := 1 / math.cos(2 * pi * bandwidth / period)
+    alpha1 := gamma1 - math.sqrt(gamma1 * gamma1 - 1)
+    BP := .5 * (1 - alpha1) * (HP - nz(HP[2])) + beta1 * (1 + alpha1) * nz(BP[1]) - alpha1 * nz(BP[2])
+    BP := bar_index == 1 or bar_index == 2 ? 0 : BP
+
+    // Calculate Peak and Signal - L1 method (0~1 range)
+    Peak := .991 * nz(Peak[1])
+    Peak := math.abs(BP) > Peak ? math.abs(BP) : Peak
+    Signal := Peak != 0 ? BP / Peak : Signal
+
+    Signal
+
+// Function to calculate bandpass filter - L2 method (-1~1 range)
+calculateBandpassFilterL2(price, period, bandwidth) =>
+    // Constants
+    var alpha2 = 0.0
+    var HP = 0.0
+    var gamma1 = 0.0
+    var alpha1 = 0.0
+    var beta1 = 0.0
+    var BP = 0.0
+    var Peak = 0.0
+    var Signal = 0.0
+    pi = 2 * math.asin(1)
+
+    // Calculate alpha2 and HP
+    alpha2 := (math.cos(.25 * bandwidth * 2 * pi / period) + math.sin(.25 * bandwidth * 2 * pi / period) - 1) / math.cos(.25 * bandwidth * 2 * pi / period)
+    HP := (1 + alpha2 / 2) * (price - nz(price[1])) + (1 - alpha2) * nz(HP[1])
+
+    // Calculate gamma1, alpha1, beta1 and BP
+    beta1 := math.cos(2 * pi / period)
+    gamma1 := 1 / math.cos(2 * pi * bandwidth / period)
+    alpha1 := gamma1 - math.sqrt(gamma1 * gamma1 - 1)
+    BP := .5 * (1 - alpha1) * (HP - nz(HP[2])) + beta1 * (1 + alpha1) * nz(BP[1]) - alpha1 * nz(BP[2])
+    BP := bar_index == 1 or bar_index == 2 ? 0 : BP
+
+    // Calculate Peak and Signal - L2 method (-1~1 range)
+    Peak := .991 * nz(Peak[1])
+    Peak := math.abs(BP) > Peak ? math.abs(BP) : Peak
+    Signal := Peak != 0 ? BP / Peak : Signal
+
+    // Convert from 0~1 range to -1~1 range
+    Signal := (Signal * 2) - 1
+
+    Signal
+
+// Function to calculate dominant cycle based on selected method
+calculateDominantCycle(price) =>
+    var cycle = 0.0
+    priceForCycle = useHighLow ? hlc3 : price
+    
+    if dominantCycleMethod == "HoDyDC"
+        cycle := dc_ta.EhlersHoDyDC(priceForCycle, cyclePart)
+    else if dominantCycleMethod == "PhAcDC"
+        cycle := dc_ta.EhlersPhAcDC(priceForCycle, cyclePart)
+    else if dominantCycleMethod == "DuDiDC"
+        cycle := dc_ta.EhlersDuDiDC(priceForCycle, cyclePart)
+    else if dominantCycleMethod == "CycPer"
+        cycle := dc_ta.EhlersCycPer(priceForCycle, 0.07, cyclePart)
+    else if dominantCycleMethod == "BPZC"
+        cycle := dc_ta.EhlersBPZC(priceForCycle, 0.6, 15)
+    else if dominantCycleMethod == "AutoPer"
+        cycle := dc_ta.EhlersAutoPer(priceForCycle, 3.0, cyclePart)
+    else if dominantCycleMethod == "DFTDC"
+        cycle := dc_ta.EhlersDFTDC(priceForCycle, 50, cyclePart)
+    
+    cycle
+
+// Function to apply smoothing based on selected method
+applySmoothing(signal, length, method) =>
+    if method == "sma"
+        ta.sma(signal, length)
+    else if method == "ema"
+        ta.ema(signal, length)
+    else if method == "hma"
+        ta.wma(2 * ta.wma(signal, length / 2) - ta.wma(signal, length), int(math.sqrt(length)))
+
+// Function to mix the filters based on selected method
+mixFilters(dominant, subdominant, method, weight, threshold) =>
+    mixed = 0.0
+    
+    if method == "weighted"
+        mixed := weight * dominant + (1 - weight) * subdominant
+    else if method == "sum"
+        mixed := dominant + subdominant
+    else if method == "difference"
+        mixed := dominant - subdominant
+    else if method == "dominant"
+        mixed := dominant
+    else if method == "subdominant"
+        mixed := subdominant
+    else if method == "adaptive"
+        // Adaptive mixing based on dominant cycle strength
+        dominantStrength = math.abs(dominant)
+        subdominantStrength = math.abs(subdominant)
+        totalStrength = dominantStrength + subdominantStrength
+        
+        if totalStrength > threshold
+            adaptiveWeight = dominantStrength / totalStrength
+            mixed := adaptiveWeight * dominant + (1 - adaptiveWeight) * subdominant
+        else
+            mixed := (dominant + subdominant) / 2
+    
+    mixed
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+
+// Calculate dominant and subdominant cycles
+dominantCycle = calculateDominantCycle(priceSource)
+subdominantCycle = 0.0
+
+if subdominantFixed
+    subdominantCycle := float(subdominantFixedPeriod)
+else
+    subdominantCycle := math.max(5, math.round(dominantCycle * subdominantRatio))
+
+// Ensure minimum cycle lengths
+dominantCycle := math.max(dominantCycle, 5)
+subdominantCycle := math.max(subdominantCycle, 5)
+
+// Initialize variables to avoid undeclared identifier errors
+var float dominantFilter = na
+var float subdominantFilter = na
+var float l1Signal = na
+var float l2Signal = na
+var float combinedL3Signal = na
+var float smoothedSignal = na
+
+// Calculate bandpass filter outputs based on selected method
+if calculationMethod == "l1"
+    // L1 method only (0~1 range)
+    dominantFilter := calculateBandpassFilterL1(priceSource, dominantCycle, dominantBandwidth)
+    subdominantFilter := calculateBandpassFilterL1(priceSource, subdominantCycle, subdominantBandwidth)
+    mixedSignal = mixFilters(dominantFilter, subdominantFilter, mixingMethod, dominantWeight, adaptiveThreshold)
+    smoothedSignal := math.ceil(applySmoothing(mixedSignal, smoothingLength, smoothingMethod))
+    l1Signal := smoothedSignal
+    l2Signal := na
+    combinedL3Signal := na
+else if calculationMethod == "l2"
+    // L2 method only (-1~1 range)
+    dominantFilter := calculateBandpassFilterL2(priceSource, dominantCycle, dominantBandwidth)
+    subdominantFilter := calculateBandpassFilterL2(priceSource, subdominantCycle, subdominantBandwidth)
+    mixedSignal = mixFilters(dominantFilter, subdominantFilter, mixingMethod, dominantWeight, adaptiveThreshold)
+    smoothedSignal := math.ceil(applySmoothing(mixedSignal, smoothingLength, smoothingMethod))
+    l1Signal := na
+    l2Signal := smoothedSignal
+    combinedL3Signal := na
+else
+    // Both methods combined - Simple addition of L1 and L2 final outputs
+    // Calculate L1 final signal (same as L1 method)
+    dominantFilterL1 = calculateBandpassFilterL1(priceSource, dominantCycle, dominantBandwidth)
+    subdominantFilterL1 = calculateBandpassFilterL1(priceSource, subdominantCycle, subdominantBandwidth)
+    mixedSignalL1 = mixFilters(dominantFilterL1, subdominantFilterL1, mixingMethod, dominantWeight, adaptiveThreshold)
+    l1FinalSignal = math.ceil(applySmoothing(mixedSignalL1, smoothingLength, smoothingMethod))
+    
+    // Calculate L2 final signal (same as L2 method)
+    dominantFilterL2 = calculateBandpassFilterL2(priceSource, dominantCycle, dominantBandwidth)
+    subdominantFilterL2 = calculateBandpassFilterL2(priceSource, subdominantCycle, subdominantBandwidth)
+    mixedSignalL2 = mixFilters(dominantFilterL2, subdominantFilterL2, mixingMethod, dominantWeight, adaptiveThreshold)
+    l2FinalSignal = math.ceil(applySmoothing(mixedSignalL2, smoothingLength, smoothingMethod))
+    
+    // Simple addition of L1 and L2 final outputs (L1 range: 0~1, L2 range: -1~1, Result: -1~2)
+    combinedL3Signal := l1FinalSignal + l2FinalSignal
+    
+    // Store individual signals for plotting
+    l1Signal := l1FinalSignal
+    l2Signal := l2FinalSignal
+    smoothedSignal := na
+    
+    // Set dominant and subdominant filters to L1 for consistency in plotting
+    dominantFilter := dominantFilterL1
+    subdominantFilter := subdominantFilterL1
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+
+// Plot individual filters if enabled
+plot(plotIndividualFilters ? dominantFilter : na, "Dominant Filter", color=color.new(dominantColor, 50), linewidth=1)
+plot(plotIndividualFilters ? subdominantFilter : na, "Subdominant Filter", color=color.new(subdominantColor, 50), linewidth=1)
+
+// Plot L1 signal if enabled and available
+plot(not na(l1Signal) ? l1Signal : na, "L1 Signal", color=l1Color, linewidth=1)
+
+// Plot L2 signal if enabled and available
+plot(not na(l2Signal) ? l2Signal : na, "L2 Signal", color=l2Color, linewidth=1)
+
+// Plot the combined L3 signal with step-like style if available
+plot(not na(combinedL3Signal) ? combinedL3Signal : na, "Combined L3 Signal", 
+     color=combinedL3Color, linewidth=2, style=plot.style_stepline)
+
+// Plot the combined signal for single methods
+plot(not na(smoothedSignal) ? smoothedSignal : na, "Combined Signal", color=combinedColor, linewidth=2)
+
+// Plot zero line if enabled
+hline(showZeroLine ? 0 : na, "Zero Line", color=zeroLineColor, linestyle=hline.style_dashed, linewidth=1)
+
+// Fill between zero line and combined L3 signal if enabled
+fill(plot(showFill and not na(combinedL3Signal) ? combinedL3Signal : na), plot(showFill and showZeroLine ? 0 : na), showFill and not na(combinedL3Signal) ? (combinedL3Signal > 0 ? color.new(color.green, 70) : color.new(color.red, 70)) : na)
+
+// Fill between zero line and single method signal if enabled
+fill(plot(showFill and not na(smoothedSignal) ? smoothedSignal : na), plot(showFill and showZeroLine ? 0 : na), showFill and not na(smoothedSignal) ? (smoothedSignal > 0 ? color.new(color.green, 70) : color.new(color.red, 70)) : na)
+
+// // Plot cycle information if enabled
+// var lookbackLength = 50
+// label.new(plotCycleInfo ? bar_index : na, ta.highest(smoothedSignal,lookbackLength) + 0.05,
+//  str.tostring(math.round(dominantCycle)) + "/" + str.tostring(math.round(subdominantCycle)),
+//  color=textColor, style=label.style_label_left, textalign=text.align_left, size=size.small)
+
+// ============================================================================
+// DIVERGENCE DETECTION
+// ============================================================================
+
+// Determine which signal to use for divergence detection
+divergenceSignal = not na(combinedL3Signal) ? combinedL3Signal : 
+                  not na(l2Signal) ? l2Signal :
+                  not na(l1Signal) ? l1Signal : smoothedSignal
+
+// Initialize divergence conditions
+bullCond = false
+bearCond = false
+
+// Divergence inputs
+lbLookbackRight = input.int(5, title="Pivot Lookback Right", group="Divergence Settings")
+lbLookbackLeft = input.int(5, title="Pivot Lookback Left", group="Divergence Settings")
+
+// Regular Bullish
+oscHL = divergenceSignal[lbLookbackRight] > ta.valuewhen(ta.pivotlow(divergenceSignal, lbLookbackLeft, lbLookbackRight), divergenceSignal[lbLookbackRight], 1) and _inRange(ta.pivotlow(divergenceSignal, lbLookbackLeft, lbLookbackRight)[1])
+priceLL = low[lbLookbackRight] < ta.valuewhen(ta.pivotlow(divergenceSignal, lbLookbackLeft, lbLookbackRight), low[lbLookbackRight], 1)
+bullCond := priceLL and oscHL and ta.pivotlow(divergenceSignal, lbLookbackLeft, lbLookbackRight)
+
+plot(ta.pivotlow(divergenceSignal, lbLookbackLeft, lbLookbackRight) and plotDivergence ? divergenceSignal[lbLookbackRight] : na, offset=-lbLookbackRight, title="Regular Bullish", linewidth=7, color=bullCond ? bullColor : noneColor)
+//plotshape(bullCond and plotDivergence ? divergenceSignal[lbLookbackRight] : na, offset=-lbLookbackRight, title="Regular Bullish Label", text=" Bull ", style=shape.labelup, location=location.absolute, color=bullColor, textcolor=textColor)
+    
+// Regular Bearish
+oscLH = divergenceSignal[lbLookbackRight] < ta.valuewhen(ta.pivothigh(divergenceSignal, lbLookbackLeft, lbLookbackRight), divergenceSignal[lbLookbackRight], 1) and _inRange(ta.pivothigh(divergenceSignal, lbLookbackLeft, lbLookbackRight)[1])
+priceHH = high[lbLookbackRight] > ta.valuewhen(ta.pivothigh(divergenceSignal, lbLookbackLeft, lbLookbackRight), high[lbLookbackRight], 1)
+bearCond := priceHH and oscLH and ta.pivothigh(divergenceSignal, lbLookbackLeft, lbLookbackRight)
+
+plot(ta.pivothigh(divergenceSignal, lbLookbackLeft, lbLookbackRight) and plotDivergence ? divergenceSignal[lbLookbackRight] : na, offset=-lbLookbackRight, title="Regular Bearish", linewidth=7, color=bearCond ? bearColor : noneColor)
+//plotshape(bearCond and plotDivergence ? divergenceSignal[lbLookbackRight] : na, offset=-lbLookbackRight, title="Regular Bearish Label", text=" Bear ", style=shape.labeldown, location=location.absolute, color=bearColor, textcolor=textColor)
+
+// ============================================================================
+// ALERT CONDITIONS
+// ============================================================================
+
+alertcondition(bullCond, title="Bullish divergence found", message="Check charts for a bullish divergence found")
+alertcondition(bearCond, title="Bearish divergence found", message="Check charts for a bearish divergence found")
+
+// Cross alerts
+alertcondition(ta.crossover(divergenceSignal, 0), title="Signal crosses above zero", message="Signal has crossed above zero")
+alertcondition(ta.crossunder(divergenceSignal, 0), title="Signal crosses below zero", message="Signal has crossed below zero")
